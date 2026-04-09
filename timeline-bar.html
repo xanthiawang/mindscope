@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MindScope Timeline</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { background: transparent; overflow: hidden; height: 100%; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .dock {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 96px;
+        background: rgba(8, 8, 8, 0.88);
+        backdrop-filter: blur(24px) saturate(1.5);
+        -webkit-backdrop-filter: blur(24px) saturate(1.5);
+        border-top: 0.5px solid rgba(255,255,255,0.08);
+        display: flex;
+        flex-direction: column;
+        cursor: default;
+        user-select: none;
+      }
+
+      /* App icons / thumbnail strip — like Screenpipe's dock */
+      .icon-strip {
+        display: flex;
+        align-items: flex-end;
+        height: 40px;
+        padding: 0 8px;
+        gap: 1px;
+        position: relative;
+      }
+
+      .app-block {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 3px 3px 0 0;
+        cursor: pointer;
+        transition: all 0.12s ease;
+        position: relative;
+        min-width: 4px;
+      }
+      .app-block:hover {
+        filter: brightness(1.3);
+        transform: scaleY(1.1);
+        transform-origin: bottom;
+      }
+      .app-block .app-letter {
+        font-size: 7px;
+        font-weight: 700;
+        color: rgba(255,255,255,0.7);
+        text-transform: uppercase;
+        pointer-events: none;
+      }
+
+      /* Audio waveform */
+      .waveform {
+        display: flex;
+        align-items: center;
+        height: 28px;
+        padding: 0 8px;
+        gap: 0.5px;
+        border-top: 0.5px solid rgba(255,255,255,0.04);
+      }
+      .wave-bar {
+        flex: 1;
+        min-width: 1.5px;
+        border-radius: 0.75px;
+        transition: background 0.1s;
+      }
+
+      /* Time labels */
+      .time-labels {
+        display: flex;
+        height: 16px;
+        padding: 0 8px;
+        align-items: center;
+      }
+      .time-labels span {
+        flex: 1;
+        text-align: center;
+        font-size: 9px;
+        font-family: "SF Mono", "Menlo", monospace;
+        color: rgba(255,255,255,0.18);
+        letter-spacing: -0.3px;
+      }
+
+      /* Current time indicator */
+      .now-indicator {
+        position: absolute;
+        top: 0;
+        width: 2px;
+        height: 100%;
+        background: #ef4444;
+        box-shadow: 0 0 6px rgba(239,68,68,0.5);
+        z-index: 10;
+        pointer-events: none;
+      }
+      .now-indicator::after {
+        content: '';
+        position: absolute;
+        top: -3px;
+        left: -3px;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #ef4444;
+      }
+
+      /* Hover tooltip */
+      .tooltip {
+        position: absolute;
+        bottom: 100%;
+        margin-bottom: 6px;
+        transform: translateX(-50%);
+        background: rgba(20,20,20,0.95);
+        border: 0.5px solid rgba(255,255,255,0.12);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 10px;
+        color: rgba(255,255,255,0.7);
+        white-space: nowrap;
+        pointer-events: none;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        z-index: 20;
+        display: none;
+      }
+
+      /* Selection highlight */
+      .selection-overlay {
+        position: absolute;
+        top: 0;
+        height: 100%;
+        background: rgba(59,130,246,0.15);
+        border-left: 1.5px solid rgba(59,130,246,0.6);
+        border-right: 1.5px solid rgba(59,130,246,0.6);
+        pointer-events: none;
+        z-index: 5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dock">
+      <div class="icon-strip" id="iconStrip">
+        <div class="now-indicator" id="nowIndicator"></div>
+      </div>
+      <div class="waveform" id="waveform"></div>
+      <div class="time-labels" id="timeLabels"></div>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+
+    <script>
+      const iconStrip = document.getElementById('iconStrip');
+      const waveform = document.getElementById('waveform');
+      const timeLabels = document.getElementById('timeLabels');
+      const tooltip = document.getElementById('tooltip');
+      const nowIndicator = document.getElementById('nowIndicator');
+
+      // App colors (consistent per-app)
+      function stringToColor(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const h = Math.abs(hash) % 360;
+        return `hsl(${h}, 55%, 45%)`;
+      }
+
+      // Generate time labels
+      for (let h = 0; h < 24; h++) {
+        const span = document.createElement('span');
+        span.textContent = h % 2 === 0 ? String(h).padStart(2, '0') + ':00' : '';
+        timeLabels.appendChild(span);
+      }
+
+      // Generate waveform bars
+      for (let i = 0; i < 288; i++) {
+        const bar = document.createElement('div');
+        bar.className = 'wave-bar';
+        const seed = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
+        const noise = seed - Math.floor(seed);
+        bar.style.height = (2 + noise * 6) + 'px';
+        bar.style.background = 'rgba(99,102,241,0.1)';
+        waveform.appendChild(bar);
+      }
+
+      // Update now indicator position
+      function updateNowIndicator() {
+        const now = new Date();
+        const pct = (now.getHours() * 60 + now.getMinutes()) / (24 * 60) * 100;
+        nowIndicator.style.left = pct + '%';
+      }
+      updateNowIndicator();
+      setInterval(updateNowIndicator, 60000);
+
+      // Listen for data from main window
+      if (window.__TAURI__) {
+        window.__TAURI__.event.listen('timeline-update', (event) => {
+          const frames = event.payload;
+          if (!Array.isArray(frames)) return;
+
+          // Clear existing blocks
+          while (iconStrip.children.length > 1) {
+            if (iconStrip.lastChild !== nowIndicator) {
+              iconStrip.removeChild(iconStrip.lastChild);
+            } else break;
+          }
+
+          // Group frames by app
+          const hourBlocks = new Map();
+          for (const frame of frames) {
+            const h = parseInt(frame.timestamp.slice(11, 13), 10);
+            const key = h + '_' + frame.app_name;
+            if (!hourBlocks.has(key)) {
+              hourBlocks.set(key, { hour: h, app: frame.app_name, count: 0 });
+            }
+            hourBlocks.get(key).count++;
+          }
+
+          // Create app blocks
+          const maxCount = Math.max(1, ...Array.from(hourBlocks.values()).map(b => b.count));
+
+          // Fill all 24 hours
+          for (let h = 0; h < 24; h++) {
+            const hourEntries = Array.from(hourBlocks.values()).filter(b => b.hour === h);
+
+            if (hourEntries.length === 0) {
+              const empty = document.createElement('div');
+              empty.className = 'app-block';
+              empty.style.flex = '1';
+              empty.style.background = 'rgba(30,30,30,0.3)';
+              empty.style.height = '15%';
+              iconStrip.appendChild(empty);
+            } else {
+              for (const entry of hourEntries) {
+                const block = document.createElement('div');
+                block.className = 'app-block';
+                block.style.flex = String(entry.count);
+                block.style.background = stringToColor(entry.app);
+                block.style.height = Math.max(25, (entry.count / maxCount) * 100) + '%';
+
+                if (entry.count > 3) {
+                  const letter = document.createElement('span');
+                  letter.className = 'app-letter';
+                  letter.textContent = entry.app[0];
+                  block.appendChild(letter);
+                }
+
+                block.onmouseenter = (e) => {
+                  tooltip.textContent = `${String(entry.hour).padStart(2,'0')}:00 — ${entry.app} (${entry.count} frames)`;
+                  tooltip.style.display = 'block';
+                  tooltip.style.left = e.clientX + 'px';
+                };
+                block.onmouseleave = () => { tooltip.style.display = 'none'; };
+                block.onclick = () => {
+                  if (window.__TAURI__) {
+                    window.__TAURI__.event.emit('timeline-hour-selected', entry.hour);
+                  }
+                };
+
+                iconStrip.appendChild(block);
+              }
+            }
+          }
+
+          // Update waveform
+          const waveBars = waveform.children;
+          for (let i = 0; i < 288; i++) {
+            const hour = Math.floor(i / 12);
+            const hourFrames = frames.filter(f => parseInt(f.timestamp.slice(11,13),10) === hour);
+            const hasData = hourFrames.length > 0;
+            const seed = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
+            const noise = seed - Math.floor(seed);
+            if (hasData) {
+              const intensity = hourFrames.length / maxCount;
+              waveBars[i].style.height = (4 + intensity * 18 + noise * 6) + 'px';
+              waveBars[i].style.background = 'rgba(99,102,241,0.35)';
+            }
+          }
+        });
+      }
+    </script>
+  </body>
+</html>
