@@ -1,14 +1,8 @@
 # MindScope
 
-**Your AI-powered digital memory. Never forget what you saw, heard, or discussed.**
+**Your screen memory. Never forget what you saw, heard, or discussed.**
 
-MindScope runs silently in the background, capturing your screen activity and transforming it into searchable, structured knowledge — all processed locally on your Mac.
-
-It comes with a built-in personal knowledge OS (**Synapse**) that auto-maintains a living vault of projects, people, meetings, and daily journals — no separate setup required.
-
----
-
-## How It Works
+MindScope runs silently in the background, capturing your screen and audio into a searchable, structured knowledge base — processed entirely on your Mac.
 
 <p align="center">
   <img src="assets/howit_works.png" width="700" />
@@ -16,242 +10,92 @@ It comes with a built-in personal knowledge OS (**Synapse**) that auto-maintains
 
 ---
 
-## Quick Start
+## Install
 
-### 1. Install
+1. Download `MindScope_0.1.0_aarch64.dmg` from [Releases](https://github.com/xanthiawang/mindscope/releases/latest) and drag to Applications.
+2. Grant **Screen Recording** and **Microphone** in System Settings → Privacy & Security.
+3. Install `ffmpeg` for audio recording — `brew install ffmpeg`.
+4. *(Optional)* Install `claude` CLI for AI features — `brew install claude`.
 
-Download `MindScope_0.1.0_aarch64.dmg` from [Releases](https://github.com/xanthiawang/mindscope/releases). Open the DMG and drag MindScope to Applications.
-
-### 2. Grant Permissions
-
-On first launch, grant **two permissions**:
-
-1. **Screen Recording** — System Settings → Privacy & Security → Screen & System Audio Recording → toggle on MindScope
-2. **Microphone** — A dialog pops up automatically the first time a meeting is detected. Click Allow. (Or pre-grant it under System Settings → Privacy & Security → Microphone)
-
-> After granting Screen Recording, you must **quit and reopen MindScope** for it to take effect.
-
-### 3. Launch
-
-MindScope lives as a thin bar at the bottom of your screen. Click anywhere on the bar to reveal controls.
+**Requirements:** macOS 11+ (tested on Sequoia 15), Apple Silicon recommended.
 
 ---
 
-## Daily Workflow
+## The Bar
 
-### Bottom Bar at a Glance
+MindScope lives as a thin bar at the bottom of your screen. Everything starts here.
 
 <p align="center">
   <img src="assets/ui.png" width="800" />
 </p>
 
-| Action | How |
-|--------|-----|
-| **Toggle recording audio** | Click the mic button (turns red + pulses when recording) |
-| **Open Daily Brief** | Click the clipboard icon |
-| **Refresh Brief (run Synapse)** | Click "Refresh" in the Brief panel — triggers the AI loop |
-| **Ask AI** | Click the "Ask" field, type a question, press Enter |
-| **Enter Rewind mode** | Click the rewind button or click anywhere on the timeline |
-| **Scrub timeline** | Move cursor over the timeline — time pill follows your mouse |
-| **Browse history** | Two-finger swipe on the timeline |
-| **Jump to date** | Click the time label for a calendar picker |
-| **Search** | In Rewind mode, click the search field |
-| **Settings** | Click the gear icon |
-| **Layered Esc** | 1st press closes panels → 2nd exits rewind → 3rd hides UI (background keeps running) |
+| Element | Action |
+|---|---|
+| **Search** | Full-text search across OCR and meeting transcripts |
+| **Time label** | Click to open the calendar and jump to any date |
+| **Mic toggle** | Start/stop recording manually (red pulse = recording) |
+| **Daily Brief** | Auto-generated summary of today's activity |
+| **Ask AI** | Natural-language questions about your screen history |
+| **Rewind** | Enter timeline scrub mode to replay your day |
+| **Settings** | Capture interval, audio, privacy, excluded apps |
+| **24-hour timeline** | Click or drag to jump to any moment; time pill follows your cursor |
 
-### Timeline
-
-The bottom bar shows **a full 24-hour day** at once. Every segment on the bar is a different app (color-coded). Click any point to jump to that moment. Hour ticks every 3 hours help you locate time ranges.
-
-### Search Screen History
-
-In Rewind mode, click the search field and type anything you remember — a keyword, a phrase, a URL. FTS5-powered full-text search scans OCR-extracted text from every frame and highlights matches with yellow boxes.
-
-Filter by app or by date using the dropdowns.
-
-### Ask AI About Your Screen
-
-Type a natural-language question in the "Ask" field:
-- *"What did I work on this morning?"*
-- *"Find the Figma link my coworker shared"*
-- *"Summarize my Zoom meeting at 2pm"*
-
-The AI uses your screen history + OCR text + meeting transcripts + vault knowledge to answer.
-
-### Daily Brief
-
-Click the 📋 clipboard icon for an auto-generated summary:
-
-- **Now** — currently active app and window
-- **Today** — top 5 apps with time breakdown
-- **Recent Meetings** — last 3 meeting sessions with type, date, title
-- **Focus / Tasks** — from `~/.mindscope/vault/_working-memory.md` (if present)
-- **Stats** — frame count, apps touched, active minutes
+Press `Esc` to hide the UI — background recording keeps running.
 
 ---
 
-## Meeting & Audio Recording
-
-### Automatic Meeting Detection
-
-MindScope auto-starts recording when it detects you're **actively in a meeting** (not just that an app is open). Detection uses:
-
-1. **NSWorkspace** — is Zoom / Tencent Meeting / Teams / Lark / etc. running?
-2. **CoreAudio** — is the default microphone input device *currently in use*?
-
-Both conditions must be true → MindScope starts a new audio session.
-
-Supported meeting apps:
-- Zoom, Microsoft Teams, Google Meet, Webex, FaceTime, Skype, Discord
-- Tencent Meeting (腾讯会议), Lark (飞书), DingTalk (钉钉), WeMeet
-
-### Manual Recording
-
-Click the 🎙️ mic button in the bottom bar to start/stop recording at any time. The button:
-- **Gray** — not recording
-- **Red + pulsing dot** — recording (manual or auto)
-
-Clicking the red button stops recording immediately (within ~200ms).
-
-### Real-Time Transcription
-
-Audio is transcribed in real time using a local Whisper model (`ggml-base.bin`, 141MB, multilingual — supports Chinese and 97 other languages). Latency: **2.5 – 3.5 seconds** end-to-end.
-
-- **Metal GPU accelerated** on Apple Silicon
-- **Streaming PCM pipeline** — no file I/O between ffmpeg and Whisper
-- **Cross-segment dedup** — kills hallucination loops
-- **RMS silence gate** — skips empty audio
-
-Real-time transcripts appear in the AI panel's **Transcript** tab while a meeting is running.
-
-### Meeting Sessions
-
-Sessions are defined by **activity**, not time:
-- One Zoom meeting = one session
-- One Tencent Meeting = one session
-- A manual 10-minute recording = another session
-
-Find all past sessions under **Search → Meetings**. Each session is a clickable card with:
-- Colored app badge (Zoom blue, Tencent green, Teams purple, Manual orange, unknown apps indigo)
-- Duration and segment count
-- Transcript preview
-
-Click a card to open the **full transcript** in a detail modal with a "Copy All" button.
-
-### Privacy Suppression
-
-Clicking the mic button during an auto-recorded meeting stops it and suppresses auto-restart for the rest of that meeting. Auto-recording resumes normally for the next meeting.
-
----
-
-## Features
-
-### Screen Recording
-- **HEVC video** encoding (Apple Silicon hardware accelerated)
-- **Smart frame dedup** (histogram + perceptual hash) saves 60%+ storage
-- **Full-text OCR** — English + Chinese, yellow highlight boxes on search results
-- **Multi-monitor** support — automatically picks the monitor with the most content
-- **App exclusion list** — configurable in Settings
-- **MindScope self-excluded** from its own captures
+## Core Concepts
 
 ### Timeline & Rewind
-- Full 24-hour day view on the bottom bar (scale by time, not frame count)
-- Hour tick marks every 3 hours
-- Two-finger swipe, click-to-scrub, arrow key navigation
-- Calendar picker to jump to any date
-- Cross-day scrolling (auto-loads previous/next day)
 
-### Meeting Intelligence
-- Smart detection: meeting app running **AND** mic actively in use
-- Activity-based session grouping
-- Real-time multilingual Whisper transcription (Metal-accelerated)
-- Cross-segment deduplication
-- Auto-generated meeting notes to Knowledge Vault (via Claude CLI if installed)
+The bottom bar shows a full 24-hour day at once with color-coded app segments and 3-hour tick marks. Click anywhere to jump to that moment; a red scrubber marks your current position. In rewind mode, a time pill follows your mouse showing the exact minute at the cursor, and two-finger swipe scrolls through history. Rewind past midnight to cross into the previous day.
 
-### AI Assistant
-- Chat + Transcript tabs in the AI panel
-- Natural-language Q&A over screen history + vault + meeting transcripts
-- Daily Brief with 5 sections (Now / Today / Recent Meetings / Focus / Tasks / Stats)
-- Quick actions during meetings: "What should I say?", "Recap", "Follow-up questions"
-- Esc key — layered dismiss (close panels → exit rewind → hide UI, background keeps running)
+### Search
 
-### Synapse — Built-in Personal Knowledge OS
-- **Zero-config**: no external install, no OAuth, no extra daemon. Ships bundled with MindScope.
-- **Auto-bootstrap** on first launch: seeds `~/.mindscope/synapse/` + `~/.mindscope/vault/` with skill definitions and a working-memory template
-- **Background AI loop**: every 30 minutes, Claude CLI reads the last 2 hours of screen activity + audio transcripts and refreshes `_working-memory.md` — Current Focus, Live Tasks, Today's Activity, Recent People
-- **Manual refresh**: the Refresh button in the Brief panel triggers a Synapse update on demand and polls until complete
-- **Wispr Flow / dictation filter**: Synapse ignores false-positive "mic in use" signals from dictation apps so recording only auto-starts for real meetings
-- **Works with Claude CLI only**: no API keys, no cloud storage, no external services
+Full-text FTS5 search runs against OCR-extracted text from every frame. Results highlight matching regions with yellow boxes on the screenshot. Filter by app, date range, or switch to the Meetings tab to browse session transcripts.
 
-### Knowledge Vault
-- People profiles with auto-updated last contact dates
-- Meeting notes linked to attendees and projects
-- Daily journal auto-generated at end of day
-- Cross-references via wikilinks (Obsidian-compatible markdown)
-- Bundled skills for vault maintenance: `command-center`, `daily-journal`, `detect-people`, `dendron-add`, `dendron-query`, `sync/vault-updater`
+### Meetings
 
-### Automation (Pipes)
-- YAML-defined pipelines with cron schedules
-- Built-in: Daily Summary, Meeting Notes
-- Output to clipboard, file, or notification
+MindScope auto-detects active meetings by combining two signals: a known meeting app is running (Zoom, Tencent Meeting, Teams, Google Meet, Webex, FaceTime, Lark, DingTalk, WeMeet, Discord) **and** the microphone is actively in use. Both must be true to avoid false positives from dictation tools like Wispr Flow or superwhisper.
 
-### Privacy
-- **100% local processing** — nothing uploaded
-- PII auto-redaction (credit cards, IDs, phone numbers)
-- App exclusion list
-- Private browsing mode (skip Incognito windows)
+When detected, MindScope streams audio to a local multilingual Whisper model (`ggml-base.bin`, 141 MB, Metal-accelerated on Apple Silicon). Transcripts appear in real time in the AI panel's Transcript tab. End-to-end latency is 2–4 seconds.
+
+**Sessions are activity-based, not time-based:** one Zoom meeting = one session, even if it spans hours. A manual 10-minute recording is a separate session. Find them under Search → Meetings as clickable cards with colored app badges and full transcripts.
+
+### Synapse — built-in knowledge OS
+
+On first launch, MindScope bootstraps a local AI loop called Synapse into `~/.mindscope/synapse/` and seeds `~/.mindscope/vault/` with a working-memory template. Every 30 minutes (or on-demand via the Brief panel's Refresh button), Synapse reads your recent screen activity + meeting transcripts and asks Claude CLI to update `_working-memory.md` with the current Focus, Tasks, Today's Activity, and Recent People.
+
+The Daily Brief reads from this file, so the more you use MindScope, the more contextual the Brief becomes. Synapse ships with bundled skills (`command-center`, `daily-journal`, `detect-people`, `dendron-add/query`, `vault-updater`) that Claude uses to maintain vault files. No external install, no OAuth, no cloud.
 
 ---
 
-## Data Storage
+## Privacy & Data
 
-All data lives under `~/.mindscope/`:
+Everything is local. No data leaves your Mac. All files live under `~/.mindscope/`:
 
 ```
 ~/.mindscope/
 ├── data/
-│   ├── frames/              # Screenshots (JPEG, organized by date)
-│   ├── segments/            # HEVC video segments
-│   ├── audio/               # Audio chunks + transcripts, indexed by date
-│   └── mindscope.db         # SQLite database (frames, OCR, FTS5 index)
-├── vault/                   # Knowledge vault (markdown)
-│   ├── CLAUDE.md              # Synapse system prompt (copy of bundled)
-│   ├── _working-memory.md     # Your current focus + tasks (auto-updated)
-│   ├── meet.*.md              # Meeting notes (auto-created from audio sessions)
-│   ├── daily.journal.*.md     # Daily journals (auto-generated at end of day)
-│   ├── user.*.md              # People profiles
-│   ├── proj.*.md              # Project files
-│   └── .claude/skills -> ../synapse/.claude/skills  (symlink)
-├── synapse/                 # Synapse knowledge OS (bundled resources)
-│   ├── CLAUDE.md              # System prompt
-│   └── .claude/skills/        # Skill definitions (command-center, etc.)
+│   ├── frames/          # JPEG screenshots by date
+│   ├── segments/        # HEVC video
+│   ├── audio/           # Audio chunks + transcripts
+│   └── mindscope.db     # SQLite + FTS5 index
+├── vault/               # Markdown knowledge base
+│   ├── _working-memory.md
+│   ├── meet.*.md        # Auto-created per session
+│   ├── daily.journal.*.md
+│   └── user.*.md
+├── synapse/             # AI skill definitions
 ├── models/
-│   └── ggml-base.bin        # Multilingual Whisper model (141 MB, auto-downloaded)
-├── bin/                     # Compiled Swift helpers
-│   ├── active_app             # Frontmost app detection
-│   ├── is_meeting             # Meeting + dictation filter
-│   ├── topmost_window         # Z-order window picker
-│   ├── capture_window         # ScreenCaptureKit wrapper
-│   ├── check_mic              # Mic permission check
-│   ├── hevc_encoder           # Streaming HEVC encoder
-│   └── frame_reader           # Video playback helper
-├── settings.json            # User preferences
-└── pipes/                   # Automation YAML configs
+│   └── ggml-base.bin    # Multilingual Whisper
+├── bin/                 # Swift helpers
+└── settings.json
 ```
 
-Typical storage: **~400MB / day** with default settings.
+**Typical storage:** ~400 MB/day with default settings. Adjust retention in Settings.
 
----
-
-## Optional: AI Features
-
-Install [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) to enable AI chat, meeting note generation, and daily brief synthesis:
-
-```sh
-brew install claude
-```
-
-Without Claude CLI, Search / Rewind / Timeline / Transcription all work normally; only AI chat + auto-generated meeting summaries are disabled.
+**Privacy features:** PII auto-redaction (credit cards, IDs, phone numbers), configurable app exclusion list, private browsing mode that skips Incognito windows. MindScope is also self-excluded from its own captures.
 
 ---
 
@@ -268,29 +112,15 @@ Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg`.
 
 ---
 
-## Requirements
-
-- **macOS 11.0+** (tested on macOS 15 Sequoia)
-- **Apple Silicon** recommended (Metal GPU accelerates Whisper)
-- **Screen Recording** + **Microphone** permissions
-- **ffmpeg** for audio recording: `brew install ffmpeg`
-- Optional: **Claude CLI** for AI features
-
----
-
 ## Troubleshooting
 
-**Screenshots show only the desktop wallpaper**
-Reset Screen Recording permission: `tccutil reset ScreenCapture com.mindscope.rewind`, then re-grant under System Settings. Quit and relaunch MindScope.
+**Screenshots show only the desktop wallpaper.** TCC Screen Recording permission is stale. Run `tccutil reset ScreenCapture com.mindscope.rewind`, re-grant under System Settings, then quit and relaunch.
 
-**Meeting detected but no transcription**
-Check that `ffmpeg` is installed at `/opt/homebrew/bin/ffmpeg` or `/usr/local/bin/ffmpeg`. Verify the Whisper model exists at `~/.mindscope/models/ggml-base.bin`.
+**Meeting detected but no transcription.** Check `ffmpeg` is installed at `/opt/homebrew/bin/ffmpeg` and the Whisper model exists at `~/.mindscope/models/ggml-base.bin`.
 
-**Microphone not showing in Privacy settings**
-MindScope only appears after the first mic-access attempt. Trigger it by clicking the mic button in the bar or joining a meeting — macOS will pop up the permission dialog once.
+**MindScope not in Privacy → Microphone.** Click the mic button in the bar — macOS will show the permission dialog on first use.
 
-**Timeline shows "0 frames"**
-Verify SQLite DB exists: `sqlite3 ~/.mindscope/data/mindscope.db "SELECT COUNT(*) FROM frames;"`. If non-zero, the frontend is reading the wrong date — check your timezone.
+**Synapse loop not updating working memory.** Install Claude CLI (`brew install claude`) and verify it runs without errors in `~/.mindscope/vault/`.
 
 ---
 
