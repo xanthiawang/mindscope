@@ -6,6 +6,14 @@ MindScope runs silently in the background, capturing your screen activity and tr
 
 ---
 
+## How It Works
+
+<p align="center">
+  <img src="assets/howit_works.png" width="700" />
+</p>
+
+---
+
 ## Quick Start
 
 ### 1. Install
