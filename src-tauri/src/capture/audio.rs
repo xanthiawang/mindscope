@@ -141,6 +141,7 @@ impl AudioRecorder {
                 let mut pcm_buf: Vec<i16> = Vec::with_capacity(BATCH_SAMPLES * 2);
                 let mut byte_buf = vec![0u8; 4096];
                 let mut last_batch_start = std::time::Instant::now();
+                let mut last_transcript = String::new();
 
                 while running.load(Ordering::Relaxed) {
                     // Read raw PCM bytes from ffmpeg stdout
@@ -173,17 +174,32 @@ impl AudioRecorder {
                         // Transcribe directly from memory (no file I/O)
                         if let Ok(transcript) = super::whisper::transcribe_samples(&batch) {
                             if !transcript.is_empty() {
-                                let segment = AudioSegment {
-                                    timestamp: batch_ts,
-                                    audio_path: String::new(), // no file
-                                    transcript,
-                                    duration_secs: BATCH_SECONDS as u32,
-                                };
-                                save_audio_segment(&date, segment);
+                                // Cross-segment dedup: skip if identical to previous or contained in it
+                                let norm = transcript.trim().to_lowercase();
+                                let prev_norm = last_transcript.trim().to_lowercase();
+                                let is_dup = norm == prev_norm
+                                    || (norm.len() > 10 && prev_norm.contains(&norm))
+                                    || (prev_norm.len() > 10 && norm.contains(&prev_norm) && norm.len() < prev_norm.len() + 10);
+
+                                if !is_dup {
+                                    let segment = AudioSegment {
+                                        timestamp: batch_ts,
+                                        audio_path: String::new(),
+                                        transcript: transcript.clone(),
+                                        duration_secs: BATCH_SECONDS as u32,
+                                    };
+                                    save_audio_segment(&date, segment);
+                                    last_transcript = transcript;
+                                }
                             }
                         }
 
                         last_batch_start = std::time::Instant::now();
+                    }
+
+                    // Check suppression every iteration for fast stop
+                    if super::recorder::is_audio_suppressed() {
+                        break;
                     }
 
                     // Safety: if reading is stalled, restart ffmpeg

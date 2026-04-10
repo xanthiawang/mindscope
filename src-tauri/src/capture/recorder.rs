@@ -22,6 +22,11 @@ pub fn suppress_auto_audio() {
     MEETING_AUDIO_SUPPRESSED.store(true, Ordering::Relaxed);
 }
 
+/// Check if audio is currently suppressed (used by audio streaming loop)
+pub fn is_audio_suppressed() -> bool {
+    MEETING_AUDIO_SUPPRESSED.load(Ordering::Relaxed)
+}
+
 /// Get the current meeting state: (active, app_name, start_time_epoch_micros)
 pub fn get_meeting_state() -> (bool, String, i64) {
     let active = MEETING_ACTIVE.load(Ordering::Relaxed);
@@ -139,6 +144,14 @@ impl Recorder {
 
                 // Honor manual suppression: user stopped auto-recording
                 let suppressed = MEETING_AUDIO_SUPPRESSED.load(Ordering::Relaxed);
+
+                // If user suppressed while recording, stop IMMEDIATELY (every frame, not just % 3)
+                if suppressed && meeting_audio_active {
+                    auto_audio.stop();
+                    meeting_audio_active = false;
+                    // Also kill any lingering ffmpeg children
+                    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+                }
 
                 if in_meeting && !meeting_audio_active && !suppressed {
                     let has_mic = audio::check_mic_permission();

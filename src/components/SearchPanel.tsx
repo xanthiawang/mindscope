@@ -89,14 +89,57 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
 
   // Audio transcript segments for Meetings tab
   interface AudioSeg { timestamp: string; audio_path: string; transcript: string; duration_secs: number; }
-  const [audioSegments, setAudioSegments] = useState<AudioSeg[]>([]);
+  interface MeetingSession {
+    startTime: string;
+    endTime: string;
+    duration: number; // seconds
+    fullTranscript: string;
+    segmentCount: number;
+  }
+  const [meetingSessions, setMeetingSessions] = useState<MeetingSession[]>([]);
 
-  // Load audio segments when Meetings tab is active
+  // Load audio segments when Meetings tab is active, group by session
   useEffect(() => {
     if (tab !== "meetings") return;
-    const today = new Date().toISOString().split("T")[0];
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
     invoke<AudioSeg[]>("get_audio_segments", { date: today })
-      .then((segs) => setAudioSegments(segs.filter((s) => s.transcript && s.transcript.trim().length > 0)))
+      .then((segs) => {
+        const valid = segs.filter((s) => s.transcript && s.transcript.trim().length > 0);
+        // Group consecutive segments into sessions (gap > 5 min = new session)
+        const sessions: MeetingSession[] = [];
+        const SESSION_GAP_MS = 5 * 60 * 1000;
+        const parseTs = (ts: string) => new Date(ts).getTime();
+
+        for (const seg of valid) {
+          const segTime = parseTs(seg.timestamp);
+          const last = sessions[sessions.length - 1];
+          if (last && segTime - parseTs(last.endTime) < SESSION_GAP_MS) {
+            // Extend existing session
+            // Dedupe: skip if transcript identical to last few lines
+            const lines = last.fullTranscript.split(" | ");
+            const segText = seg.transcript.trim();
+            if (!lines.slice(-3).some((l) => l === segText)) {
+              last.fullTranscript += " | " + segText;
+              last.segmentCount += 1;
+            }
+            last.endTime = seg.timestamp;
+            last.duration = Math.round((segTime - parseTs(last.startTime)) / 1000) + seg.duration_secs;
+          } else {
+            // New session
+            sessions.push({
+              startTime: seg.timestamp,
+              endTime: seg.timestamp,
+              duration: seg.duration_secs,
+              fullTranscript: seg.transcript.trim(),
+              segmentCount: 1,
+            });
+          }
+        }
+        // Newest first
+        sessions.reverse();
+        setMeetingSessions(sessions);
+      })
       .catch(() => {});
   }, [tab]);
 
@@ -382,24 +425,37 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
             <p style={{ fontSize: 11, color: "#c4c4c6", textAlign: "center" }}>Star important moments to find them quickly</p>
           </div>
         ) : tab === "meetings" && !query.trim() ? (
-          /* Show audio transcripts when Meetings tab and no search */
-          audioSegments.length === 0 ? (
-            <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>No meeting transcripts today</p>
+          /* Show meeting sessions — one card per session, full transcript inside */
+          meetingSessions.length === 0 ? (
+            <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>No meeting sessions today</p>
           ) : (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8 }}>
-              {audioSegments.map((seg, i) => {
-                const time = seg.timestamp.length >= 16 ? seg.timestamp.slice(11, 16) : seg.timestamp;
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {meetingSessions.map((session, i) => {
+                const fmtTime = (ts: string) => ts.length >= 16 ? ts.slice(11, 16) : ts;
+                const durMin = Math.round(session.duration / 60);
+                const previewText = session.fullTranscript.length > 400
+                  ? session.fullTranscript.slice(0, 400) + "…"
+                  : session.fullTranscript;
                 return (
                   <div key={i} style={{
-                    background: "#fff", borderRadius: 12, border: "1px solid rgba(0,0,0,0.06)",
-                    overflow: "hidden", cursor: "default",
+                    background: "#fff", borderRadius: 14, border: "1px solid rgba(0,0,0,0.06)",
+                    overflow: "hidden", padding: "14px 16px",
                   }}>
-                    <div style={{ padding: "10px 12px", minHeight: 80, fontSize: 12, color: "#374151", lineHeight: 1.5, overflow: "hidden", maxHeight: 110 }}>
-                      {seg.transcript.slice(0, 150) || "No transcript"}
+                    {/* Session header */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: "#1d1d1f" }}>
+                        {fmtTime(session.startTime)} — {fmtTime(session.endTime)}
+                      </span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>{durMin} min</span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>{session.segmentCount} segments</span>
                     </div>
-                    <div style={{ padding: "4px 10px 6px", display: "flex", alignItems: "center", gap: 4, borderTop: "1px solid rgba(0,0,0,0.04)" }}>
-                      <span style={{ fontSize: 10, color: "#86868b", flex: 1 }}>Transcript</span>
-                      <span style={{ fontSize: 10, color: "#aeaeb2" }}>{time}</span>
+                    {/* Full transcript */}
+                    <div style={{ fontSize: 12, color: "#374151", lineHeight: 1.6, maxHeight: 200, overflowY: "auto" }}>
+                      {previewText.split(" | ").map((line, j) => (
+                        <div key={j} style={{ marginBottom: 4 }}>{line}</div>
+                      ))}
                     </div>
                   </div>
                 );
