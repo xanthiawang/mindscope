@@ -226,52 +226,11 @@ Typical storage: **~400MB / day** with default settings.
 
 ---
 
-## Architecture
+## User Interface
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    MindScope (Tauri 2)                    │
-├──────────────────────────────────────────────────────────┤
-│  Frontend (React + TypeScript)                           │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐ │
-│  │ Timeline │ │  Search  │ │    AI    │ │  Settings  │ │
-│  │   Bar    │ │  Panel   │ │  Panel   │ │   Panel    │ │
-│  │ 24h view │ │ Apps     │ │Chat│Trans│ │ General    │ │
-│  │ Scrub    │ │ Meetings │ │ Quick   │ │ Audio      │ │
-│  │ Rewind   │ │ Starred  │ │ Actions │ │ Privacy    │ │
-│  └──────────┘ └──────────┘ └──────────┘ └────────────┘ │
-│                                                          │
-│  HTTP API (port 9457)         Tauri IPC (invoke)        │
-├──────────────────────────────────────────────────────────┤
-│  Backend (Rust)                                          │
-│                                                          │
-│  Recording Engine                                        │
-│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
-│  │ Screenshot│ │  HEVC    │ │   OCR    │ │  Frame    │ │
-│  │  (xcap)   │ │ Encoder  │ │ (Vision) │ │  Dedup    │ │
-│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
-│                                                          │
-│  Audio Engine (streaming pipeline)                       │
-│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
-│  │  ffmpeg   │ │ PCM buf  │ │ whisper  │ │  Session  │ │
-│  │  stdout   │→│ 2s+over  │→│ (Metal)  │→│  Tracker  │ │
-│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
-│                                                          │
-│  Meeting Detection (Swift helpers via CoreAudio)        │
-│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
-│  │is_meeting │ │check_mic │ │topmost_  │ │ active_   │ │
-│  │NSWorkspace│ │AVFound.  │ │ window   │ │   app     │ │
-│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
-│                                                          │
-│  Knowledge Layer                                         │
-│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
-│  │  Vault    │ │  Daily   │ │ Working  │ │   Pipe    │ │
-│  │  Sync     │ │ Journal  │ │ Memory   │ │ Scheduler │ │
-│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
-│                                                          │
-│  Storage: SQLite (FTS5) + JPEG + HEVC (.mp4)            │
-└──────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="assets/ui.png" width="800" />
+</p>
 
 ---
 
