@@ -21,6 +21,34 @@ function isMeetingApp(appName: string): boolean {
   return MEETING_APPS.some((k) => lower.includes(k));
 }
 
+/// Returns a short label and color for a given session type.
+/// Known meeting apps get specific colors; unknown apps get a
+/// generic gray badge with a truncated version of the app name.
+function getSessionTypeStyle(sessionType: string): { label: string; color: string } {
+  if (!sessionType) return { label: "Recording", color: "#8e8e93" };
+
+  const lower = sessionType.toLowerCase();
+
+  // Known meeting apps with brand colors
+  if (lower === "manual") return { label: "Manual", color: "#ff9500" };
+  if (lower === "legacy") return { label: "Recording", color: "#8e8e93" };
+  if (lower.includes("zoom")) return { label: "Zoom", color: "#2d8cff" };
+  if (lower.includes("tencent") || sessionType.includes("腾讯")) return { label: "腾讯会议", color: "#00a85a" };
+  if (lower.includes("teams")) return { label: "Teams", color: "#6264a7" };
+  if (lower.includes("meet") && lower.includes("google")) return { label: "Meet", color: "#00897b" };
+  if (lower.includes("webex")) return { label: "Webex", color: "#00bceb" };
+  if (lower.includes("facetime")) return { label: "FaceTime", color: "#34c759" };
+  if (lower.includes("discord")) return { label: "Discord", color: "#5865f2" };
+  if (lower.includes("skype")) return { label: "Skype", color: "#00aff0" };
+  if (lower.includes("lark") || sessionType.includes("飞书")) return { label: "飞书", color: "#00d6b9" };
+  if (lower.includes("dingtalk") || sessionType.includes("钉钉")) return { label: "钉钉", color: "#1677ff" };
+  if (lower.includes("wemeet")) return { label: "WeMeet", color: "#00a85a" };
+
+  // Unknown app — generic "Meeting" badge with the truncated app name visible
+  const shortName = sessionType.length > 12 ? sessionType.slice(0, 12) + "…" : sessionType;
+  return { label: shortName, color: "#5e5ce6" };
+}
+
 // SVG icon components (no emoji)
 function ChevronDownIcon({ size = 10 }: { size?: number }) {
   return (
@@ -106,6 +134,7 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
     segmentCount: number;
   }
   const [meetingSessions, setMeetingSessions] = useState<MeetingSession[]>([]);
+  const [expandedSession, setExpandedSession] = useState<MeetingSession | null>(null);
 
   // Load audio segments when Meetings tab is active, group by session_id
   useEffect(() => {
@@ -439,55 +468,46 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
             <p style={{ fontSize: 11, color: "#c4c4c6", textAlign: "center" }}>Star important moments to find them quickly</p>
           </div>
         ) : tab === "meetings" && !query.trim() ? (
-          /* Show meeting sessions — one card per session, full transcript inside */
           meetingSessions.length === 0 ? (
             <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>No meeting sessions today</p>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8 }}>
               {meetingSessions.map((session, i) => {
                 const fmtTime = (ts: string) => ts.length >= 16 ? ts.slice(11, 16) : ts;
                 const durMin = Math.round(session.duration / 60);
-                const previewText = session.fullTranscript.length > 600
-                  ? session.fullTranscript.slice(0, 600) + "…"
-                  : session.fullTranscript;
-                // Session type styling
-                const typeLabel = session.sessionType === "manual"
-                  ? "Manual Recording"
-                  : session.sessionType === "legacy"
-                    ? "Recording"
-                    : session.sessionType; // actual app name like "Zoom" or "Tencent Meeting"
-                const typeColor = session.sessionType === "manual" ? "#ff9500"
-                  : session.sessionType?.toLowerCase().includes("zoom") ? "#2d8cff"
-                  : session.sessionType?.toLowerCase().includes("tencent") || session.sessionType?.includes("腾讯") ? "#00a85a"
-                  : session.sessionType?.toLowerCase().includes("teams") ? "#6264a7"
-                  : session.sessionType?.toLowerCase().includes("discord") ? "#5865f2"
-                  : "#86868b";
+                const preview = session.fullTranscript.replace(/ \| /g, " ").slice(0, 150);
+                const { label: typeLabel, color: typeColor } = getSessionTypeStyle(session.sessionType);
                 return (
-                  <div key={i} style={{
-                    background: "#fff", borderRadius: 14, border: "1px solid rgba(0,0,0,0.06)",
-                    overflow: "hidden", padding: "14px 16px",
-                  }}>
-                    {/* Session header */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                  <div
+                    key={i}
+                    onClick={() => setExpandedSession(session)}
+                    style={{
+                      background: "#fff", borderRadius: 12, border: "1px solid rgba(0,0,0,0.06)",
+                      overflow: "hidden", cursor: "pointer",
+                      transition: "transform 0.15s, box-shadow 0.15s",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.transform = "translateY(-1px)";
+                      e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.08)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = "translateY(0)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                  >
+                    <div style={{ padding: "10px 12px", minHeight: 80, fontSize: 12, color: "#374151", lineHeight: 1.5, overflow: "hidden", maxHeight: 110 }}>
+                      {preview || "No transcript"}
+                    </div>
+                    <div style={{ padding: "6px 10px", display: "flex", alignItems: "center", gap: 4, borderTop: "1px solid rgba(0,0,0,0.04)" }}>
                       <span style={{
-                        fontSize: 11, fontWeight: 600, color: "#fff",
-                        background: typeColor, padding: "2px 8px", borderRadius: 20,
+                        fontSize: 9, fontWeight: 600, color: "#fff",
+                        background: typeColor, padding: "1px 6px", borderRadius: 20,
+                        textTransform: "uppercase", letterSpacing: 0.3,
                       }}>
                         {typeLabel}
                       </span>
-                      <span style={{ fontSize: 12, fontWeight: 600, color: "#1d1d1f" }}>
-                        {fmtTime(session.startTime)} — {fmtTime(session.endTime)}
-                      </span>
-                      <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
-                      <span style={{ fontSize: 11, color: "#86868b" }}>{durMin}m</span>
-                      <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
-                      <span style={{ fontSize: 11, color: "#86868b" }}>{session.segmentCount} segments</span>
-                    </div>
-                    {/* Full transcript */}
-                    <div style={{ fontSize: 12, color: "#374151", lineHeight: 1.6, maxHeight: 240, overflowY: "auto" }}>
-                      {previewText.split(" | ").map((line, j) => (
-                        <div key={j} style={{ marginBottom: 4 }}>{line}</div>
-                      ))}
+                      <span style={{ fontSize: 10, color: "#86868b", flex: 1 }}>{durMin}m · {session.segmentCount}</span>
+                      <span style={{ fontSize: 10, color: "#aeaeb2" }}>{fmtTime(session.startTime)}</span>
                     </div>
                   </div>
                 );
@@ -536,6 +556,96 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
           {new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
         </span>
       </div>
+
+      {/* Session detail modal */}
+      {expandedSession && (() => {
+        const session = expandedSession;
+        const fmtTime = (ts: string) => ts.length >= 16 ? ts.slice(11, 16) : ts;
+        const durMin = Math.round(session.duration / 60);
+        const { label: typeLabel, color: typeColor } = getSessionTypeStyle(session.sessionType);
+        const lines = session.fullTranscript.split(" | ").filter((l) => l.trim());
+        return (
+          <div
+            onClick={() => setExpandedSession(null)}
+            style={{
+              position: "fixed", inset: 0,
+              background: "rgba(0,0,0,0.4)", backdropFilter: "blur(8px)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              zIndex: 10000, padding: 40,
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                background: "#fff", borderRadius: 16, width: "min(720px, 100%)",
+                maxHeight: "80vh", display: "flex", flexDirection: "column",
+                boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+              }}
+            >
+              {/* Header */}
+              <div style={{
+                padding: "16px 20px", borderBottom: "1px solid rgba(0,0,0,0.06)",
+                display: "flex", alignItems: "center", gap: 10,
+              }}>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, color: "#fff",
+                  background: typeColor, padding: "3px 10px", borderRadius: 20,
+                  textTransform: "uppercase", letterSpacing: 0.5,
+                }}>
+                  {typeLabel}
+                </span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: "#1d1d1f" }}>
+                    {fmtTime(session.startTime)} — {fmtTime(session.endTime)}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#86868b", marginTop: 2 }}>
+                    {durMin} min · {session.segmentCount} segments
+                  </div>
+                </div>
+                <button
+                  onClick={() => setExpandedSession(null)}
+                  style={{
+                    background: "rgba(0,0,0,0.05)", border: "none", borderRadius: 100,
+                    width: 28, height: 28, cursor: "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    color: "#86868b",
+                  }}
+                >
+                  <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" strokeWidth="1.8"><path d="M1 1l8 8M9 1l-8 8" /></svg>
+                </button>
+              </div>
+              {/* Full transcript */}
+              <div style={{
+                flex: 1, overflowY: "auto", padding: "16px 20px",
+                fontSize: 13, color: "#1d1d1f", lineHeight: 1.7,
+              }}>
+                {lines.map((line, j) => (
+                  <div key={j} style={{ marginBottom: 8 }}>{line}</div>
+                ))}
+              </div>
+              {/* Footer — copy button */}
+              <div style={{
+                padding: "10px 20px", borderTop: "1px solid rgba(0,0,0,0.06)",
+                display: "flex", justifyContent: "flex-end", gap: 8,
+              }}>
+                <button
+                  onClick={() => {
+                    const text = session.fullTranscript.replace(/ \| /g, "\n");
+                    navigator.clipboard.writeText(text);
+                  }}
+                  style={{
+                    background: "rgba(0,0,0,0.05)", border: "none", borderRadius: 100,
+                    padding: "6px 16px", fontSize: 12, color: "#1d1d1f", cursor: "pointer",
+                    fontWeight: 500,
+                  }}
+                >
+                  Copy All
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
