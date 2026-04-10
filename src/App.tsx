@@ -58,7 +58,13 @@ type Mode = "bar" | "rewind";
 
 function App() {
   const [mode, setMode] = useState<Mode>("bar");
-  const [date, setDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [date, setDate] = useState(() => {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, "0");
+    const d = String(now.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  });
   const [frames, setFrames] = useState<CapturedFrame[]>([]);
   const [frameIndex, setFrameIndex] = useState(0);
   const loadingRef = useRef(false); // prevent concurrent date loads
@@ -88,9 +94,9 @@ function App() {
   const loadPrevDay = useCallback(async () => {
     if (loadingRef.current) return;
     loadingRef.current = true;
-    const d = new Date(date);
+    const d = new Date(date + "T12:00:00");
     d.setDate(d.getDate() - 1);
-    const prevDate = d.toISOString().split("T")[0];
+    const prevDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     const prevFrames = await getTimeline(prevDate);
     if (prevFrames.length > 0) {
       setDate(prevDate);
@@ -103,12 +109,13 @@ function App() {
   // Load next day when scrubbing past the right edge
   const loadNextDay = useCallback(async () => {
     if (loadingRef.current) return;
-    const today = new Date().toISOString().split("T")[0];
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
     if (date >= today) { loadingRef.current = false; return; } // can't go past today
     loadingRef.current = true;
-    const d = new Date(date);
+    const d = new Date(date + "T12:00:00");
     d.setDate(d.getDate() + 1);
-    const nextDate = d.toISOString().split("T")[0];
+    const nextDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     const nextFrames = await getTimeline(nextDate);
     if (nextFrames.length > 0) {
       setDate(nextDate);
@@ -149,10 +156,13 @@ function App() {
     if (!hasPermission) return;
     const t = setInterval(() => {
       getTimeline(date).then((f) => {
-        setFrames(f);
-        setFrameIndex((prev) => prev >= f.length - 2 ? f.length - 1 : prev);
+        if (f.length !== frames.length) {
+          setFrames(f);
+          // Auto-follow latest if user was near the end
+          setFrameIndex((prev) => prev >= frames.length - 3 ? f.length - 1 : prev);
+        }
       });
-    }, 8000);
+    }, 3000);
     return () => clearInterval(t);
   }, [date, hasPermission]);
 

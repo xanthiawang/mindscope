@@ -18,21 +18,48 @@ pub fn check_mic_permission() -> bool {
     if MIC_PERMISSION_GRANTED.load(Ordering::Relaxed) {
         return true;
     }
-    // Check by trying to list audio devices (doesn't trigger dialog)
-    let output = Command::new("system_profiler")
-        .args(["SPAudioDataType", "-json"])
+
+    // Method 1: Check macOS AVFoundation authorization status via osascript
+    let output = Command::new("osascript")
+        .args(["-e", r#"use framework "AVFoundation"
+set status to current application's AVCaptureDevice's authorizationStatusForMediaType:(current application's AVMediaTypeAudio)
+if status = 3 then
+    return "authorized"
+else
+    return "denied"
+end if"#])
         .output()
         .ok();
-    // If we've successfully recorded before, we have permission
+
+    if let Some(out) = output {
+        let result = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+        if result.contains("authorized") {
+            MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
+            MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
+            return true;
+        }
+    }
+
+    // Method 2: Fallback — if we've successfully recorded before, we have permission
     let audio_dir = db::data_dir().join("audio");
     if audio_dir.exists() {
         if let Ok(entries) = fs::read_dir(&audio_dir) {
-            if entries.count() > 0 {
-                MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
-                return true;
+            for entry in entries.flatten() {
+                // Check subdirs for actual audio files, not just empty dirs
+                if entry.path().is_dir() {
+                    if let Ok(files) = fs::read_dir(entry.path()) {
+                        if files.into_iter().any(|f| f.ok().map_or(false, |f| {
+                            f.path().extension().map_or(false, |ext| ext == "m4a" || ext == "wav")
+                        })) {
+                            MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
+                            return true;
+                        }
+                    }
+                }
             }
         }
     }
+
     MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
     false
 }

@@ -55,8 +55,8 @@ impl Recorder {
             let mut meeting_start_ts: i64 = 0;
             let mut meeting_app_name = String::new();
             let meeting_apps = ["zoom.us", "Zoom", "FaceTime", "Microsoft Teams",
-                "Webex", "Discord", "Tencent Meeting", "腾讯会议",
-                "DingTalk", "钉钉", "飞书", "Lark", "Skype"];
+                "Webex", "Discord", "Tencent Meeting", "TencentMeeting", "腾讯会议",
+                "DingTalk", "钉钉", "飞书", "Lark", "Skype", "WeMeet"];
             let auto_audio = audio::AudioRecorder::new(30);
 
             log::info!("MindScope recorder started, interval={}s", interval);
@@ -282,6 +282,9 @@ end tell
             if (app.contains("飞书") || app.contains("lark")) && (title.contains("会议") || title.contains("meeting")) { return true; }
             // 钉钉 with meeting window
             if (app.contains("钉钉") || app.contains("dingtalk")) && (title.contains("会议") || title.contains("meeting")) { return true; }
+            // 腾讯会议 / Tencent Meeting / WeMeet — any window with "会议" or meeting-related title
+            if (app.contains("tencentmeeting") || app.contains("tencent meeting") || app.contains("腾讯会议") || app.contains("wemeet"))
+                && (title.contains("会议") || title.contains("meeting") || !title.is_empty()) { return true; }
         }
     }
     false
@@ -374,11 +377,12 @@ fn generate_meeting_vault(start_ts: i64, end_ts: i64, app_name: &str, window_nam
 
 /// Call Claude CLI, return response or None
 fn call_claude_cli(prompt: &str) -> Option<String> {
-    let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope/vault");
+    let vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
     let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
-    let output = std::process::Command::new("claude")
+    let output = std::process::Command::new("/opt/homebrew/bin/claude")
         .args(["-p", prompt])
         .current_dir(&cwd)
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
         .ok()?;
     if output.status.success() {
