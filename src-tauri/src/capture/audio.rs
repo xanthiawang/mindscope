@@ -182,11 +182,14 @@ impl AudioRecorder {
                                     || (prev_norm.len() > 10 && norm.contains(&prev_norm) && norm.len() < prev_norm.len() + 10);
 
                                 if !is_dup {
+                                    let (session_id, session_type) = super::recorder::get_current_session();
                                     let segment = AudioSegment {
                                         timestamp: batch_ts,
                                         audio_path: String::new(),
                                         transcript: transcript.clone(),
                                         duration_secs: BATCH_SECONDS as u32,
+                                        session_id,
+                                        session_type,
                                     };
                                     save_audio_segment(&date, segment);
                                     last_transcript = transcript;
@@ -397,6 +400,13 @@ pub struct AudioSegment {
     pub audio_path: String,
     pub transcript: String,
     pub duration_secs: u32,
+    /// Session ID: unique per activity/meeting (e.g. timestamp of session start)
+    /// Empty string for legacy segments recorded before session tracking.
+    #[serde(default)]
+    pub session_id: String,
+    /// Session type: "zoom", "tencent", "teams", "manual", etc.
+    #[serde(default)]
+    pub session_type: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]

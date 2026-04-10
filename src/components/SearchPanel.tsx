@@ -88,17 +88,26 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
   const [searchRegions, setSearchRegions] = useState<Record<number, Array<{text:string,x:number,y:number,w:number,h:number}>>>({});
 
   // Audio transcript segments for Meetings tab
-  interface AudioSeg { timestamp: string; audio_path: string; transcript: string; duration_secs: number; }
+  interface AudioSeg {
+    timestamp: string;
+    audio_path: string;
+    transcript: string;
+    duration_secs: number;
+    session_id?: string;
+    session_type?: string;
+  }
   interface MeetingSession {
+    sessionId: string;
+    sessionType: string;
     startTime: string;
     endTime: string;
-    duration: number; // seconds
+    duration: number;
     fullTranscript: string;
     segmentCount: number;
   }
   const [meetingSessions, setMeetingSessions] = useState<MeetingSession[]>([]);
 
-  // Load audio segments when Meetings tab is active, group by session
+  // Load audio segments when Meetings tab is active, group by session_id
   useEffect(() => {
     if (tab !== "meetings") return;
     const now = new Date();
@@ -106,28 +115,31 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
     invoke<AudioSeg[]>("get_audio_segments", { date: today })
       .then((segs) => {
         const valid = segs.filter((s) => s.transcript && s.transcript.trim().length > 0);
-        // Group consecutive segments into sessions (gap > 5 min = new session)
-        const sessions: MeetingSession[] = [];
-        const SESSION_GAP_MS = 5 * 60 * 1000;
         const parseTs = (ts: string) => new Date(ts).getTime();
 
+        // Group by session_id. Legacy segments without session_id fall back to
+        // a single "Legacy" bucket keyed by date.
+        const byId = new Map<string, MeetingSession>();
         for (const seg of valid) {
-          const segTime = parseTs(seg.timestamp);
-          const last = sessions[sessions.length - 1];
-          if (last && segTime - parseTs(last.endTime) < SESSION_GAP_MS) {
-            // Extend existing session
-            // Dedupe: skip if transcript identical to last few lines
-            const lines = last.fullTranscript.split(" | ");
+          const id = seg.session_id || `legacy-${seg.timestamp.slice(0, 10)}`;
+          const type = seg.session_type || (seg.session_id ? "unknown" : "legacy");
+          const existing = byId.get(id);
+          if (existing) {
+            // Skip duplicate transcript lines
+            const lines = existing.fullTranscript.split(" | ");
             const segText = seg.transcript.trim();
             if (!lines.slice(-3).some((l) => l === segText)) {
-              last.fullTranscript += " | " + segText;
-              last.segmentCount += 1;
+              existing.fullTranscript += " | " + segText;
+              existing.segmentCount += 1;
             }
-            last.endTime = seg.timestamp;
-            last.duration = Math.round((segTime - parseTs(last.startTime)) / 1000) + seg.duration_secs;
+            existing.endTime = seg.timestamp;
+            existing.duration = Math.round(
+              (parseTs(seg.timestamp) - parseTs(existing.startTime)) / 1000
+            ) + seg.duration_secs;
           } else {
-            // New session
-            sessions.push({
+            byId.set(id, {
+              sessionId: id,
+              sessionType: type,
               startTime: seg.timestamp,
               endTime: seg.timestamp,
               duration: seg.duration_secs,
@@ -136,8 +148,10 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
             });
           }
         }
-        // Newest first
-        sessions.reverse();
+
+        // Sort by start time, newest first
+        const sessions = Array.from(byId.values())
+          .sort((a, b) => parseTs(b.startTime) - parseTs(a.startTime));
         setMeetingSessions(sessions);
       })
       .catch(() => {});
@@ -433,26 +447,44 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
               {meetingSessions.map((session, i) => {
                 const fmtTime = (ts: string) => ts.length >= 16 ? ts.slice(11, 16) : ts;
                 const durMin = Math.round(session.duration / 60);
-                const previewText = session.fullTranscript.length > 400
-                  ? session.fullTranscript.slice(0, 400) + "…"
+                const previewText = session.fullTranscript.length > 600
+                  ? session.fullTranscript.slice(0, 600) + "…"
                   : session.fullTranscript;
+                // Session type styling
+                const typeLabel = session.sessionType === "manual"
+                  ? "Manual Recording"
+                  : session.sessionType === "legacy"
+                    ? "Recording"
+                    : session.sessionType; // actual app name like "Zoom" or "Tencent Meeting"
+                const typeColor = session.sessionType === "manual" ? "#ff9500"
+                  : session.sessionType?.toLowerCase().includes("zoom") ? "#2d8cff"
+                  : session.sessionType?.toLowerCase().includes("tencent") || session.sessionType?.includes("腾讯") ? "#00a85a"
+                  : session.sessionType?.toLowerCase().includes("teams") ? "#6264a7"
+                  : session.sessionType?.toLowerCase().includes("discord") ? "#5865f2"
+                  : "#86868b";
                 return (
                   <div key={i} style={{
                     background: "#fff", borderRadius: 14, border: "1px solid rgba(0,0,0,0.06)",
                     overflow: "hidden", padding: "14px 16px",
                   }}>
                     {/* Session header */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                      <span style={{
+                        fontSize: 11, fontWeight: 600, color: "#fff",
+                        background: typeColor, padding: "2px 8px", borderRadius: 20,
+                      }}>
+                        {typeLabel}
+                      </span>
                       <span style={{ fontSize: 12, fontWeight: 600, color: "#1d1d1f" }}>
                         {fmtTime(session.startTime)} — {fmtTime(session.endTime)}
                       </span>
                       <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
-                      <span style={{ fontSize: 11, color: "#86868b" }}>{durMin} min</span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>{durMin}m</span>
                       <span style={{ fontSize: 11, color: "#86868b" }}>·</span>
                       <span style={{ fontSize: 11, color: "#86868b" }}>{session.segmentCount} segments</span>
                     </div>
                     {/* Full transcript */}
-                    <div style={{ fontSize: 12, color: "#374151", lineHeight: 1.6, maxHeight: 200, overflowY: "auto" }}>
+                    <div style={{ fontSize: 12, color: "#374151", lineHeight: 1.6, maxHeight: 240, overflowY: "auto" }}>
                       {previewText.split(" | ").map((line, j) => (
                         <div key={j} style={{ marginBottom: 4 }}>{line}</div>
                       ))}

@@ -17,6 +17,33 @@ static MEETING_START: AtomicI64 = AtomicI64::new(0);
 // User manually stopped auto-recording this session — don't restart until meeting ends
 static MEETING_AUDIO_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
+// Current audio session — activity/task based (one meeting = one session, manual recording = another)
+static CURRENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
+static CURRENT_SESSION_TYPE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Start a new audio session. Called when a meeting is detected or user manually toggles mic.
+/// `session_type` is the app name ("Zoom", "Tencent Meeting", ...) or "manual".
+pub fn start_audio_session(session_type: &str) {
+    let id = timestamp_now(); // unique session ID = start timestamp
+    if let Ok(mut s) = CURRENT_SESSION_ID.lock() { *s = Some(id); }
+    if let Ok(mut t) = CURRENT_SESSION_TYPE.lock() { *t = Some(session_type.to_string()); }
+    log::info!("MindScope: Audio session started ({})", session_type);
+}
+
+/// End the current audio session. Called when meeting ends or user manually stops.
+pub fn end_audio_session() {
+    if let Ok(mut s) = CURRENT_SESSION_ID.lock() { *s = None; }
+    if let Ok(mut t) = CURRENT_SESSION_TYPE.lock() { *t = None; }
+    log::info!("MindScope: Audio session ended");
+}
+
+/// Get the current session (id, type) if one is active.
+pub fn get_current_session() -> (String, String) {
+    let id = CURRENT_SESSION_ID.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+    let ty = CURRENT_SESSION_TYPE.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+    (id, ty)
+}
+
 /// Called when user manually stops audio during a meeting — prevents auto-restart
 pub fn suppress_auto_audio() {
     MEETING_AUDIO_SUPPRESSED.store(true, Ordering::Relaxed);
@@ -163,13 +190,15 @@ impl Recorder {
                             writeln!(f, ">>> MEETING START! mic={} app={}", has_mic, app_name)
                         });
                     if has_mic {
+                        // Detect which meeting app is running to tag the session
+                        let session_type = detect_meeting_app_name().unwrap_or_else(|| app_name.clone());
+                        start_audio_session(&session_type);
                         auto_audio.start();
                         meeting_audio_active = true;
                         meeting_start_ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_micros() as i64;
                         meeting_app_name = app_name.clone();
-                        // Update global meeting state
                         MEETING_ACTIVE.store(true, Ordering::Relaxed);
                         MEETING_START.store(meeting_start_ts, Ordering::Relaxed);
                         if let Ok(mut m) = MEETING_APP.lock() { *m = Some(meeting_app_name.clone()); }
@@ -178,6 +207,7 @@ impl Recorder {
                 } else if !in_meeting && (meeting_audio_active || suppressed) {
                     auto_audio.stop();
                     meeting_audio_active = false;
+                    end_audio_session(); // close session when meeting ends
                     // Clear suppression when meeting ends
                     MEETING_AUDIO_SUPPRESSED.store(false, Ordering::Relaxed);
                     // Clear global meeting state
@@ -296,6 +326,19 @@ impl Recorder {
 }
 
 pub fn timestamp_now() -> String { chrono_now() }
+
+/// Get the name of the detected meeting app (e.g. "Zoom", "Tencent Meeting").
+/// Reads the Swift helper output which includes the app name.
+pub fn detect_meeting_app_name() -> Option<String> {
+    let helper = dirs_next::home_dir().unwrap_or_default()
+        .join(".mindscope").join("bin").join("is_meeting");
+    if !helper.exists() { return None; }
+    let output = std::process::Command::new(helper.to_str().unwrap_or("")).output().ok()?;
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !result.starts_with("MEETING|") { return None; }
+    let parts: Vec<&str> = result.splitn(3, '|').collect();
+    parts.get(1).map(|s| s.to_string())
+}
 
 /// Smart meeting detection using compiled Swift helper.
 /// Checks both meeting app running AND microphone actively in use.

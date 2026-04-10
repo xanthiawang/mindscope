@@ -231,11 +231,17 @@ fn request_mic_permission() -> bool {
 
 #[tauri::command]
 fn start_audio(state: State<'_, ManagedState>) -> Result<bool, String> {
-    // Check permission first
     if !audio::check_mic_permission() {
         return Err("Microphone permission not granted. Click 'Enable' to request permission.".into());
     }
     let state = state.lock().unwrap();
+    // Start a manual session (or auto if meeting already active)
+    let (existing_id, _) = capture::recorder::get_current_session();
+    if existing_id.is_empty() {
+        let session_type = capture::recorder::detect_meeting_app_name()
+            .unwrap_or_else(|| "manual".to_string());
+        capture::recorder::start_audio_session(&session_type);
+    }
     Ok(state.audio_recorder.start())
 }
 
@@ -243,24 +249,30 @@ fn start_audio(state: State<'_, ManagedState>) -> Result<bool, String> {
 fn stop_audio(state: State<'_, ManagedState>) {
     let state = state.lock().unwrap();
     state.audio_recorder.stop();
-    // Also kill any ffmpeg child processes spawned by the auto-recorder
+    // Kill any ffmpeg child processes
     let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
-    // Tell the meeting loop not to auto-restart during this session
+    // Prevent auto-restart during current meeting
     capture::recorder::suppress_auto_audio();
+    // End the session
+    capture::recorder::end_audio_session();
 }
 
 /// Toggle audio recording on/off (for manual mic button)
 #[tauri::command]
 fn toggle_audio(state: State<'_, ManagedState>) -> bool {
     let state = state.lock().unwrap();
-    // Check if ANY recording is happening (manual OR auto via ffmpeg)
     let any_recording = state.audio_recorder.is_running() || is_ffmpeg_recording();
     if any_recording {
         state.audio_recorder.stop();
         let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
         capture::recorder::suppress_auto_audio();
+        capture::recorder::end_audio_session();
         false
     } else {
+        // Starting manually — create a new session
+        let session_type = capture::recorder::detect_meeting_app_name()
+            .unwrap_or_else(|| "manual".to_string());
+        capture::recorder::start_audio_session(&session_type);
         state.audio_recorder.start()
     }
 }
