@@ -78,7 +78,9 @@ impl AudioRecorder {
         }
     }
 
-    /// Start recording — caller must ensure permission is granted first
+    /// Start recording — Retrace-style continuous streaming pipeline:
+    /// ffmpeg outputs raw 16kHz mono PCM to stdout → Rust reads in 250ms batches
+    /// → Whisper transcribes directly from in-memory samples (no file I/O)
     pub fn start(&self) -> bool {
         if self.running.load(Ordering::Relaxed) {
             return false;
@@ -86,52 +88,117 @@ impl AudioRecorder {
 
         self.running.store(true, Ordering::Relaxed);
         let running = self.running.clone();
-        let chunk_secs = self.chunk_duration_secs;
-        let speaker_mgr = self.speaker_manager.clone();
+        let _speaker_mgr = self.speaker_manager.clone();
 
         thread::spawn(move || {
-            log::info!("MindScope audio recorder started");
+            log::info!("MindScope streaming audio recorder started");
 
-            while running.load(Ordering::Relaxed) {
-                let now = super::recorder::timestamp_now();
-                let date = &now[..10];
-                let audio_dir = audio_dir(date);
+            // Find ffmpeg
+            let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]
+                .iter().find(|p| std::path::Path::new(p).exists() || **p == "ffmpeg")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "ffmpeg".to_string());
 
-                let filename = format!("audio_{}.m4a", now.replace(':', "-"));
-                let filepath = audio_dir.join(&filename);
+            // Batch settings: 2s chunks for Whisper context, fed every 2s
+            // (Whisper base needs >=1s for decent accuracy; 2s is the sweet spot)
+            const SAMPLE_RATE: u32 = 16_000;
+            const BATCH_SECONDS: f32 = 2.0;
+            const BATCH_SAMPLES: usize = (SAMPLE_RATE as f32 * BATCH_SECONDS) as usize;
+            // Overlap 0.3s between batches so words split at boundaries are caught
+            const OVERLAP_SAMPLES: usize = (SAMPLE_RATE as f32 * 0.3) as usize;
 
-                if record_chunk(&filepath, chunk_secs) && filepath.exists() {
-                    let transcript = transcribe_audio(&filepath);
-                    if !transcript.is_empty() {
-                        // Identify speaker if model is available
-                        let transcript = if speaker_mgr.is_available() {
-                            match load_audio_samples_f32(&filepath) {
-                                Some(samples) => {
-                                    let speaker = speaker_mgr.identify_speaker(&samples);
-                                    format!("[{}] {}", speaker, transcript)
-                                }
-                                None => transcript,
+            loop {
+                if !running.load(Ordering::Relaxed) { break; }
+
+                // Spawn ffmpeg with raw PCM output to stdout
+                let mut child = match std::process::Command::new(&ffmpeg)
+                    .args([
+                        "-f", "avfoundation",
+                        "-i", ":default",
+                        "-ac", "1",
+                        "-ar", "16000",
+                        "-f", "s16le",       // raw signed 16-bit PCM
+                        "-",                  // stdout
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("MindScope: ffmpeg spawn failed: {}", e);
+                        thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                };
+
+                let mut stdout = match child.stdout.take() {
+                    Some(s) => s,
+                    None => { let _ = child.kill(); continue; }
+                };
+
+                use std::io::Read;
+                let mut pcm_buf: Vec<i16> = Vec::with_capacity(BATCH_SAMPLES * 2);
+                let mut byte_buf = vec![0u8; 4096];
+                let mut last_batch_start = std::time::Instant::now();
+
+                while running.load(Ordering::Relaxed) {
+                    // Read raw PCM bytes from ffmpeg stdout
+                    let n = match stdout.read(&mut byte_buf) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+
+                    // Convert bytes to i16 samples (little-endian)
+                    for chunk in byte_buf[..n].chunks_exact(2) {
+                        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        pcm_buf.push(sample);
+                    }
+
+                    // When we have enough samples for a batch, transcribe
+                    if pcm_buf.len() >= BATCH_SAMPLES {
+                        let batch: Vec<f32> = pcm_buf[..BATCH_SAMPLES]
+                            .iter()
+                            .map(|&s| s as f32 / 32768.0)
+                            .collect();
+
+                        // Keep overlap for next batch; drop the rest
+                        let drain_end = BATCH_SAMPLES.saturating_sub(OVERLAP_SAMPLES);
+                        pcm_buf.drain(..drain_end);
+
+                        let batch_ts = super::recorder::timestamp_now();
+                        let date = batch_ts[..10].to_string();
+
+                        // Transcribe directly from memory (no file I/O)
+                        if let Ok(transcript) = super::whisper::transcribe_samples(&batch) {
+                            if !transcript.is_empty() {
+                                let segment = AudioSegment {
+                                    timestamp: batch_ts,
+                                    audio_path: String::new(), // no file
+                                    transcript,
+                                    duration_secs: BATCH_SECONDS as u32,
+                                };
+                                save_audio_segment(&date, segment);
                             }
-                        } else {
-                            transcript
-                        };
+                        }
 
-                        let transcript_path = filepath.with_extension("txt");
-                        let _ = fs::write(&transcript_path, &transcript);
+                        last_batch_start = std::time::Instant::now();
+                    }
 
-                        let segment = AudioSegment {
-                            timestamp: now.clone(),
-                            audio_path: filepath.to_string_lossy().to_string(),
-                            transcript,
-                            duration_secs: chunk_secs as u32,
-                        };
-                        save_audio_segment(date, segment);
+                    // Safety: if reading is stalled, restart ffmpeg
+                    if last_batch_start.elapsed() > Duration::from_secs(15) {
+                        break;
                     }
                 }
 
-                thread::sleep(Duration::from_secs(1));
+                let _ = child.kill();
+                let _ = child.wait();
+
+                if !running.load(Ordering::Relaxed) { break; }
+                thread::sleep(Duration::from_millis(200));
             }
-            log::info!("MindScope audio recorder stopped");
+            log::info!("MindScope streaming audio recorder stopped");
         });
 
         true

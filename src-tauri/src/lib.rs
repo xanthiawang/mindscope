@@ -243,25 +243,42 @@ fn start_audio(state: State<'_, ManagedState>) -> Result<bool, String> {
 fn stop_audio(state: State<'_, ManagedState>) {
     let state = state.lock().unwrap();
     state.audio_recorder.stop();
+    // Also kill any ffmpeg child processes spawned by the auto-recorder
+    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+    // Tell the meeting loop not to auto-restart during this session
+    capture::recorder::suppress_auto_audio();
 }
 
 /// Toggle audio recording on/off (for manual mic button)
 #[tauri::command]
 fn toggle_audio(state: State<'_, ManagedState>) -> bool {
     let state = state.lock().unwrap();
-    if state.audio_recorder.is_running() {
+    // Check if ANY recording is happening (manual OR auto via ffmpeg)
+    let any_recording = state.audio_recorder.is_running() || is_ffmpeg_recording();
+    if any_recording {
         state.audio_recorder.stop();
+        let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+        capture::recorder::suppress_auto_audio();
         false
     } else {
         state.audio_recorder.start()
     }
 }
 
-/// Check if audio is currently recording
+/// Check if audio is currently recording (manual recorder OR auto ffmpeg)
 #[tauri::command]
 fn is_audio_recording(state: State<'_, ManagedState>) -> bool {
     let state = state.lock().unwrap();
-    state.audio_recorder.is_running()
+    state.audio_recorder.is_running() || is_ffmpeg_recording()
+}
+
+/// Check if ffmpeg is currently capturing audio
+fn is_ffmpeg_recording() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", "ffmpeg.*avfoundation"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Get meeting state: { active, app_name, recording }
@@ -592,7 +609,7 @@ pub fn run() {
         .manage(Mutex::new(AppState {
             vault_path,
             recorder: Recorder::new(2),  // 2-second interval (was 5)
-            audio_recorder: AudioRecorder::new(8),
+            audio_recorder: AudioRecorder::new(2),
         }))
         .setup(move |app| {
             #[cfg(target_os = "macos")]

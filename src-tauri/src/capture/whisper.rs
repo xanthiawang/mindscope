@@ -70,6 +70,52 @@ fn ensure_context() -> Result<(), String> {
     Ok(())
 }
 
+/// Transcribe raw PCM samples directly from memory (no file I/O).
+/// Input: f32 samples normalized to [-1, 1] at 16kHz mono
+/// Used by the streaming audio pipeline for real-time transcription.
+pub fn transcribe_samples(samples: &[f32]) -> Result<String, String> {
+    if samples.is_empty() { return Ok(String::new()); }
+
+    // Skip silence (RMS energy gate)
+    let rms = (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64).sqrt();
+    if rms < 0.015 { return Ok(String::new()); }
+
+    ensure_context()?;
+    let guard = WHISPER_CTX.lock().unwrap();
+    let ctx = guard.as_ref().ok_or("Whisper not initialized")?;
+    let mut state = ctx.create_state().map_err(|e| format!("State error: {:?}", e))?;
+
+    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(4);
+    params.set_language(None);
+    params.set_translate(false);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_suppress_blank(true);
+    params.set_suppress_nst(true);
+    params.set_entropy_thold(2.2);
+    params.set_logprob_thold(-1.5);
+    params.set_no_speech_thold(0.5);
+    params.set_max_tokens(128);
+
+    state.full(params, samples).map_err(|e| format!("Transcribe error: {:?}", e))?;
+
+    let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    for i in 0..num_segments {
+        if let Some(segment) = state.get_segment(i) {
+            if let Ok(segment_text) = segment.to_str_lossy() {
+                text.push_str(&segment_text);
+                text.push(' ');
+            }
+        }
+    }
+
+    Ok(deduplicate_text(text.trim()))
+}
+
 /// Transcribe audio file using Whisper
 /// Input: path to m4a/wav file
 /// Output: transcribed text

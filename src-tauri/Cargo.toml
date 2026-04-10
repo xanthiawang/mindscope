@@ -32,7 +32,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 lru = "0.12"
 cocoa = "0.26"
 objc = "0.2"
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", features = ["metal"] }
 hound = "3.5"
 serde_yaml = "0.9"
 regex = "1"

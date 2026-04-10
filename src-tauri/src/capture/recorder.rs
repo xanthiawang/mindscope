@@ -14,6 +14,13 @@ use super::audio;
 static MEETING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MEETING_APP: Mutex<Option<String>> = Mutex::new(None);
 static MEETING_START: AtomicI64 = AtomicI64::new(0);
+// User manually stopped auto-recording this session — don't restart until meeting ends
+static MEETING_AUDIO_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Called when user manually stops audio during a meeting — prevents auto-restart
+pub fn suppress_auto_audio() {
+    MEETING_AUDIO_SUPPRESSED.store(true, Ordering::Relaxed);
+}
 
 /// Get the current meeting state: (active, app_name, start_time_epoch_micros)
 pub fn get_meeting_state() -> (bool, String, i64) {
@@ -58,7 +65,7 @@ impl Recorder {
                 "Webex", "Discord", "Tencent Meeting", "TencentMeeting",
                 "腾讯会议TencentMeeting", "腾讯会议",
                 "DingTalk", "钉钉", "飞书", "Lark", "Skype", "WeMeet"];
-            let auto_audio = audio::AudioRecorder::new(8);
+            let auto_audio = audio::AudioRecorder::new(2);
 
             log::info!("MindScope recorder started, interval={}s", interval);
 
@@ -130,7 +137,10 @@ impl Recorder {
                         writeln!(f, "  helper={} app_match={} in_meeting={}", helper_result, app_match, in_meeting)
                     });
 
-                if in_meeting && !meeting_audio_active {
+                // Honor manual suppression: user stopped auto-recording
+                let suppressed = MEETING_AUDIO_SUPPRESSED.load(Ordering::Relaxed);
+
+                if in_meeting && !meeting_audio_active && !suppressed {
                     let has_mic = audio::check_mic_permission();
                     let log_path = db::data_dir().join("debug.log");
                     let _ = std::fs::OpenOptions::new()
@@ -152,9 +162,11 @@ impl Recorder {
                         if let Ok(mut m) = MEETING_APP.lock() { *m = Some(meeting_app_name.clone()); }
                         log::info!("MindScope: Meeting detected ({}), auto-started audio", app_name);
                     }
-                } else if !in_meeting && meeting_audio_active {
+                } else if !in_meeting && (meeting_audio_active || suppressed) {
                     auto_audio.stop();
                     meeting_audio_active = false;
+                    // Clear suppression when meeting ends
+                    MEETING_AUDIO_SUPPRESSED.store(false, Ordering::Relaxed);
                     // Clear global meeting state
                     MEETING_ACTIVE.store(false, Ordering::Relaxed);
                     MEETING_START.store(0, Ordering::Relaxed);

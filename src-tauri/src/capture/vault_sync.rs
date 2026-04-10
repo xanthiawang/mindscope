@@ -148,32 +148,70 @@ fn app_time_breakdown(hours: u64) -> Vec<(String, u64)> {
 }
 
 /// List recent meeting titles from vault (last N meetings, any day).
+/// Returns formatted "Date Time — title" strings.
 fn list_recent_meetings(vault: &Path, limit: usize) -> Vec<String> {
     if !vault.exists() { return Vec::new(); }
-    let mut meetings: Vec<(String, String)> = Vec::new(); // (filename, title)
+    let mut meetings: Vec<(String, String)> = Vec::new(); // (sort_key, display)
 
     if let Ok(entries) = fs::read_dir(vault) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if !name.starts_with("meet.") || !name.ends_with(".md") { continue; }
             if let Ok(content) = fs::read_to_string(entry.path()) {
+                // Parse frontmatter: title, date, app, duration
                 let title = content.lines().find(|l| l.starts_with("title:"))
                     .map(|l| l[6..].trim().to_string())
                     .unwrap_or_default();
-                let display_title = if title.is_empty() {
-                    // Fallback to filename date
-                    name.trim_start_matches("meet.").trim_end_matches(".md").to_string()
+                let date = content.lines().find(|l| l.starts_with("date:"))
+                    .map(|l| l[5..].trim().to_string())
+                    .unwrap_or_default();
+                let app = content.lines().find(|l| l.starts_with("app:"))
+                    .map(|l| l[4..].trim().to_string())
+                    .unwrap_or_default();
+
+                // Extract first real content line from Summary section
+                let summary = content.split("## Summary").nth(1)
+                    .and_then(|s| s.lines().find(|l| {
+                        let t = l.trim();
+                        !t.is_empty() && !t.starts_with("#") && !t.starts_with("-")
+                    }))
+                    .map(|l| l.trim().chars().take(60).collect::<String>())
+                    .unwrap_or_default();
+
+                // Build display string: "Apr 10 · Tencent Meeting · first summary line"
+                let mut parts: Vec<String> = Vec::new();
+                if !date.is_empty() { parts.push(format_date_short(&date)); }
+                if !app.is_empty() { parts.push(app); }
+                let prefix = parts.join(" · ");
+
+                let display = if !title.is_empty() {
+                    format!("{} — {}", prefix, title)
+                } else if !summary.is_empty() {
+                    format!("{} — {}", prefix, summary)
+                } else if !prefix.is_empty() {
+                    prefix
                 } else {
-                    title
+                    // Last resort: filename
+                    name.trim_start_matches("meet.").trim_end_matches(".md").to_string()
                 };
-                meetings.push((name, display_title));
+                meetings.push((name, display));
             }
         }
     }
 
     // Sort by filename desc (newest first)
     meetings.sort_by(|a, b| b.0.cmp(&a.0));
-    meetings.into_iter().take(limit).map(|(_, t)| t).collect()
+    meetings.into_iter().take(limit).map(|(_, d)| d).collect()
+}
+
+/// Format "2026-04-10" → "Apr 10" (short display)
+fn format_date_short(date: &str) -> String {
+    if date.len() < 10 { return date.to_string(); }
+    let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let month: usize = date[5..7].parse().unwrap_or(1);
+    let day: u32 = date[8..10].parse().unwrap_or(1);
+    let month_name = months.get(month.saturating_sub(1)).copied().unwrap_or("");
+    format!("{} {}", month_name, day)
 }
 
 /// Today's capture stats: frames captured, active apps, time span.

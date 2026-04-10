@@ -77,7 +77,8 @@ pub fn configure_bar_mode(window: &tauri::WebviewWindow) {
             macos::set_window_level(ns_window, macos::NS_FLOATING_WINDOW_LEVEL);
             macos::set_ignore_mouse_events(ns_window, false);
             macos::set_overlay_collection_behavior(ns_window);
-            macos::set_excluded_from_capture(ns_window);
+            // Don't exclude from capture — blocks user screenshots of MindScope
+            // macos::set_excluded_from_capture(ns_window);
         }
     }
 }
@@ -89,7 +90,8 @@ pub fn configure_fullscreen_mode(window: &tauri::WebviewWindow) {
         if let Some(ns_window) = macos::get_ns_window(window) {
             macos::set_window_level(ns_window, macos::NS_SCREEN_SAVER_WINDOW_LEVEL);
             macos::set_ignore_mouse_events(ns_window, false);
-            macos::set_excluded_from_capture(ns_window);
+            // Don't exclude from capture — blocks user screenshots of MindScope
+            // macos::set_excluded_from_capture(ns_window);
         }
     }
 }

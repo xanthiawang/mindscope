@@ -85,7 +85,8 @@ function App() {
   const [aiTab, setAiTab] = useState<"chat" | "transcript">("chat");
   const [meetingActive, setMeetingActive] = useState(false);
   const [, setMeetingSessionStart] = useState<number>(0);
-  const [micManualOn, setMicManualOn] = useState(false);
+  const [audioRecording, setAudioRecording] = useState(false);
+  const [, setMicSuppressedSession] = useState(false);
   const [meetingTranscripts, setMeetingTranscripts] = useState<Array<{time: string, speaker: string, text: string}>>([]);
   const [latestTranscript, setLatestTranscript] = useState("");
   const meetingScrollRef = useRef<HTMLDivElement>(null);
@@ -209,7 +210,22 @@ function App() {
     if (!timelineRef.current || frames.length === 0) return;
     const rect = timelineRef.current.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    setFrameIndex(Math.round(ratio * (frames.length - 1)));
+
+    // Map click position to TIME, then find nearest frame
+    const firstDate = new Date(frames[0].timestamp / 1000);
+    firstDate.setHours(0, 0, 0, 0);
+    const dayStart = firstDate.getTime() * 1000;
+    const dayDuration = 24 * 3600 * 1_000_000;
+    const targetTs = dayStart + ratio * dayDuration;
+
+    // Find frame closest to targetTs
+    let closestIdx = 0;
+    let minDiff = Infinity;
+    for (let i = 0; i < frames.length; i++) {
+      const diff = Math.abs(frames[i].timestamp - targetTs);
+      if (diff < minDiff) { minDiff = diff; closestIdx = i; }
+    }
+    setFrameIndex(closestIdx);
     if (mode === "bar") setMode("rewind");
   }, [frames.length, mode]);
 
@@ -278,7 +294,7 @@ function App() {
     }
   }, [date]);
 
-  // Poll meeting status every 2s for responsive transcript updates
+  // Poll meeting status + audio recording state every 1.5s
   useEffect(() => {
     const poll = async () => {
       try {
@@ -289,32 +305,52 @@ function App() {
 
         setMeetingActive(isActive);
 
-        // Session-based transcript management
-        // If a new session started (different start_ts), clear old transcripts
+        // Reset suppression flag when meeting ends
+        if (!isActive) {
+          setMicSuppressedSession(false);
+        }
+
+        // Sync audio recording state from backend (source of truth)
+        try {
+          const rec = await invoke("is_audio_recording");
+          setAudioRecording(!!rec);
+        } catch {}
+
+        // Session-based transcript: clear when start_ts changes OR when
+        // transitioning active ↔ inactive
         setMeetingSessionStart((prev) => {
-          if (sessionStart !== prev && sessionStart > 0) {
-            // New session — clear previous
-            setMeetingTranscripts([]);
-            setLatestTranscript("");
+          const sessionChanged = sessionStart !== prev;
+          const becameInactive = prev > 0 && sessionStart === 0;
+          if (sessionChanged || becameInactive) {
+            if (sessionStart > 0 || becameInactive) {
+              setMeetingTranscripts([]);
+              setLatestTranscript("");
+            }
           }
           return sessionStart;
         });
 
         // Only show transcripts from the current session
-        const transcripts = (data.recent_transcripts || []).filter(
-          (t: { ts?: number }) => !sessionStart || !t.ts || t.ts >= sessionStart
-        );
-        setMeetingTranscripts(transcripts);
-        if (transcripts.length > 0) {
-          const last = transcripts[transcripts.length - 1];
-          setLatestTranscript(`${last.speaker}: ${last.text}`);
+        if (isActive && sessionStart > 0) {
+          const transcripts = (data.recent_transcripts || []).filter(
+            (t: { ts?: number }) => !t.ts || t.ts >= sessionStart
+          );
+          setMeetingTranscripts(transcripts);
+          if (transcripts.length > 0) {
+            const last = transcripts[transcripts.length - 1];
+            setLatestTranscript(`${last.speaker}: ${last.text}`);
+          }
+        } else {
+          // Not in a meeting — clear transcripts
+          setMeetingTranscripts([]);
+          setLatestTranscript("");
         }
       } catch {
         setMeetingActive(false);
       }
     };
     poll();
-    const t = setInterval(poll, 2000);
+    const t = setInterval(poll, 1000);
     return () => clearInterval(t);
   }, []);
 
@@ -668,25 +704,38 @@ function App() {
         {/* Frame count */}
         <span style={{ fontSize: 11, color: "#8e8e93" }}>{frames.length} frames</span>
 
-        {/* Mic toggle — prominent position next to frame count */}
+        {/* Mic toggle — always reflects backend truth */}
         <button onClick={async () => {
-          const nowRecording = await invoke("toggle_audio");
-          setMicManualOn(nowRecording as boolean);
+          // Unconditionally stop if currently recording, else start
+          if (audioRecording) {
+            await invoke("stop_audio");
+            setAudioRecording(false);
+            // Also suppress auto-restart for this meeting session
+            setMicSuppressedSession(true);
+          } else {
+            try {
+              await invoke("start_audio");
+              setAudioRecording(true);
+              setMicSuppressedSession(false);
+            } catch (e) {
+              console.error("start_audio failed", e);
+            }
+          }
         }} style={{
-          background: (micManualOn || meetingActive) ? "rgba(255,59,48,0.15)" : "rgba(0,0,0,0.04)",
-          border: (micManualOn || meetingActive) ? "1px solid rgba(255,59,48,0.3)" : "none",
+          background: audioRecording ? "rgba(255,59,48,0.15)" : "rgba(0,0,0,0.04)",
+          border: audioRecording ? "1px solid rgba(255,59,48,0.3)" : "none",
           borderRadius: 100, width: 28, height: 28,
           cursor: "pointer",
-          color: (micManualOn || meetingActive) ? "#ff3b30" : "#86868b",
+          color: audioRecording ? "#ff3b30" : "#86868b",
           display: "flex", alignItems: "center", justifyContent: "center",
           flexShrink: 0,
           position: "relative",
-        }} title={(micManualOn || meetingActive) ? "Recording — click to stop" : "Start recording"}>
+        }} title={audioRecording ? "Recording — click to stop" : "Start recording"}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
             <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
           </svg>
-          {(micManualOn || meetingActive) && (
+          {audioRecording && (
             <span style={{
               position: "absolute", top: 2, right: 2,
               width: 6, height: 6, borderRadius: 3,
@@ -1083,11 +1132,22 @@ function App() {
             <div style={{ flex: 1, overflowY: "auto", padding: "10px 16px" }}>
               {briefText ? briefText.split("\n").map((line, i) => {
                 const t = line.trim();
-                if (!t) return <div key={i} style={{ height: 6 }} />;
-                if (sectionHeaders.some((h) => t.startsWith(h))) {
-                  return <div key={i} style={{ fontSize: 11, fontWeight: 700, color: "#1d1d1f", marginTop: i > 0 ? 10 : 0, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>{t}</div>;
+                if (!t) return <div key={i} style={{ height: 8 }} />;
+                // Markdown heading: ## Section
+                if (t.startsWith("## ")) {
+                  return <div key={i} style={{ fontSize: 10, fontWeight: 700, color: "#86868b", marginTop: i > 0 ? 14 : 0, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 }}>{t.slice(3)}</div>;
                 }
-                return <div key={i} style={{ fontSize: 12, color: "#3a3a3c", lineHeight: 1.5, marginBottom: 1 }}>{t}</div>;
+                // Legacy headers
+                if (sectionHeaders.some((h) => t.startsWith(h))) {
+                  return <div key={i} style={{ fontSize: 10, fontWeight: 700, color: "#86868b", marginTop: i > 0 ? 14 : 0, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 }}>{t}</div>;
+                }
+                // Bullet line: • something
+                if (t.startsWith("• ") || t.startsWith("- ")) {
+                  return <div key={i} style={{ fontSize: 13, color: "#1d1d1f", lineHeight: 1.5, marginBottom: 3, paddingLeft: 6 }}>
+                    <span style={{ color: "#c7c7cc", marginRight: 6 }}>•</span>{t.slice(2)}
+                  </div>;
+                }
+                return <div key={i} style={{ fontSize: 13, color: "#1d1d1f", lineHeight: 1.5, marginBottom: 2 }}>{t}</div>;
               }) : (
                 <div style={{ textAlign: "center", padding: 20, color: "#86868b", fontSize: 12 }}>Loading...</div>
               )}
@@ -1173,14 +1233,50 @@ function BottomTimeline({ timelineRef, segments, frames, scrubberPos, onInteract
         })}
       </div>
 
-      {/* Track */}
+      {/* Track — scale by TIME (full 24h day), not frame count */}
       <div className="timeline-track" style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "rgba(0,0,0,0.03)" }}>
-        {segments.map((seg, i) => {
-          const startPct = frames.length > 1 ? (seg.startIdx / (frames.length - 1)) * 100 : 0;
-          const widthPct = frames.length > 1 ? ((seg.endIdx - seg.startIdx + 1) / frames.length) * 100 : 100;
-          return <div key={i} className="timeline-segment" style={{ left: `${startPct}%`, width: `${widthPct}%`, background: seg.color, opacity: 0.35 }} />;
-        })}
-        {frames.length > 0 && <div className="timeline-scrubber" style={{ left: `${scrubberPos}%` }} />}
+        {(() => {
+          // Build 24-hour timeline: 0:00 to 24:00 of the current date
+          if (frames.length === 0) return null;
+          const firstTs = frames[0].timestamp;
+          // Get midnight of that day (local time)
+          const firstDate = new Date(firstTs / 1000);
+          firstDate.setHours(0, 0, 0, 0);
+          const dayStart = firstDate.getTime() * 1000; // micros
+          const dayEnd = dayStart + 24 * 3600 * 1_000_000;
+          const dayDuration = dayEnd - dayStart;
+
+          return segments.map((seg, i) => {
+            const segStart = frames[seg.startIdx]?.timestamp || dayStart;
+            const segEnd = frames[seg.endIdx]?.timestamp || segStart;
+            const startPct = ((segStart - dayStart) / dayDuration) * 100;
+            const endPct = ((segEnd - dayStart) / dayDuration) * 100;
+            const widthPct = Math.max(0.15, endPct - startPct);
+            return <div key={i} className="timeline-segment" style={{ left: `${startPct}%`, width: `${widthPct}%`, background: seg.color, opacity: 0.55 }} />;
+          });
+        })()}
+        {/* Hour ticks — every 3 hours */}
+        {[0, 3, 6, 9, 12, 15, 18, 21].map((h) => (
+          <div key={`tick-${h}`} style={{
+            position: "absolute", top: 0, bottom: 0,
+            left: `${(h / 24) * 100}%`,
+            width: 1, background: "rgba(0,0,0,0.08)",
+            pointerEvents: "none",
+          }} />
+        ))}
+        {/* Scrubber — position based on current frame timestamp */}
+        {frames.length > 0 && (() => {
+          const firstTs = frames[0].timestamp;
+          const firstDate = new Date(firstTs / 1000);
+          firstDate.setHours(0, 0, 0, 0);
+          const dayStart = firstDate.getTime() * 1000;
+          const dayDuration = 24 * 3600 * 1_000_000;
+          // scrubberPos is 0-100 based on frameIndex; convert to time-based
+          const currentIdx = Math.round((scrubberPos / 100) * (frames.length - 1));
+          const currentTs = frames[currentIdx]?.timestamp || dayStart;
+          const timePct = ((currentTs - dayStart) / dayDuration) * 100;
+          return <div className="timeline-scrubber" style={{ left: `${timePct}%` }} />;
+        })()}
       </div>
     </div>
   );
