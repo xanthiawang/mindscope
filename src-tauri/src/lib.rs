@@ -192,6 +192,20 @@ fn hide_window(app: tauri::AppHandle) {
     }
 }
 
+/// Manually trigger a cortex update (refresh working memory via Claude CLI).
+#[tauri::command]
+async fn cortex_update() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| capture::cortex::run_cortex_update())
+        .await
+        .map_err(|e| format!("task join error: {}", e))?
+}
+
+/// Check if cortex is currently syncing.
+#[tauri::command]
+fn cortex_is_syncing() -> bool {
+    capture::cortex::is_syncing()
+}
+
 /// Hide all UI — closes panels and hides the window, but keeps background
 /// recording/transcription running. Does NOT kill child processes.
 #[tauri::command]
@@ -662,6 +676,14 @@ pub fn run() {
             // Start vault auto-sync loop (hourly working memory + daily journal)
             capture::vault_sync::start_vault_sync_loop();
 
+            // Bootstrap cortex — copies skills, CLAUDE.md, seed working memory
+            // on first run. Safe to call every startup (won't overwrite edits).
+            capture::cortex::bootstrap();
+
+            // Start cortex background loop — every 30 min, refresh working memory
+            // via Claude CLI running against ~/.mindscope/vault/
+            capture::cortex::start_cortex_loop();
+
             // Auto-start screen recording only
             // Audio recording is disabled by default — it triggers
             // macOS microphone permission dialogs. Users can enable
@@ -764,6 +786,8 @@ pub fn run() {
             list_projects,
             hide_window,
             quit_app,
+            cortex_update,
+            cortex_is_syncing,
             expand_bar,
             collapse_bar,
             set_clickthrough,
