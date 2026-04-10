@@ -135,7 +135,6 @@ Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg`.
 
 **Synapse loop not updating working memory.** Install Claude CLI (`brew install claude`) and verify it runs without errors in `~/.mindscope/vault/`. The loop routes through Claude Haiku — if you see quota warnings, check your subscription usage.
 
-**Upgrading from an older build.** If you had a previous `_context-model.md` file, Synapse automatically renames it to `_warm-memory.md` on first launch. Your notes are preserved.
 
 ---
 
