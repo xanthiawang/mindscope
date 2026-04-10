@@ -69,6 +69,7 @@ function App() {
   const [frames, setFrames] = useState<CapturedFrame[]>([]);
   const [frameIndex, setFrameIndex] = useState(0);
   const loadingRef = useRef(false); // prevent concurrent date loads
+  const lastMicToggleRef = useRef(0); // debounce poll overriding manual click
   const [_selectedResult, _setSelectedResult] = useState<CapturedFrame | null>(null);
   const [highlightQuery, setHighlightQuery] = useState("");
   const [highlightRegions, setHighlightRegions] = useState<Array<{text:string,x:number,y:number,w:number,h:number}>>([]);
@@ -101,18 +102,17 @@ function App() {
   const loadPrevDay = useCallback(async () => {
     if (loadingRef.current) return;
     loadingRef.current = true;
-    const d = new Date(date + "T12:00:00");
-    d.setDate(d.getDate() - 1);
-    const prevDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-    const prevFrames = await getTimeline(prevDate);
-    if (prevFrames.length > 0) {
-      // Set frames BEFORE date so useEffect sees populated state
-      setFrames(prevFrames);
-      setFrameIndex(prevFrames.length - 1);
-      setDate(prevDate);
-      // Release lock after React has a chance to batch updates
-      setTimeout(() => { loadingRef.current = false; }, 100);
-    } else {
+    try {
+      const d = new Date(date + "T12:00:00");
+      d.setDate(d.getDate() - 1);
+      const prevDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      const prevFrames = await getTimeline(prevDate);
+      if (prevFrames.length > 0) {
+        setFrames(prevFrames);
+        setFrameIndex(prevFrames.length - 1);
+        setDate(prevDate);
+      }
+    } finally {
       loadingRef.current = false;
     }
   }, [date]);
@@ -122,18 +122,19 @@ function App() {
     if (loadingRef.current) return;
     const now = new Date();
     const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
-    if (date >= today) { return; } // can't go past today
+    if (date >= today) return;
     loadingRef.current = true;
-    const d = new Date(date + "T12:00:00");
-    d.setDate(d.getDate() + 1);
-    const nextDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-    const nextFrames = await getTimeline(nextDate);
-    if (nextFrames.length > 0) {
-      setFrames(nextFrames);
-      setFrameIndex(0);
-      setDate(nextDate);
-      setTimeout(() => { loadingRef.current = false; }, 100);
-    } else {
+    try {
+      const d = new Date(date + "T12:00:00");
+      d.setDate(d.getDate() + 1);
+      const nextDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      const nextFrames = await getTimeline(nextDate);
+      if (nextFrames.length > 0) {
+        setFrames(nextFrames);
+        setFrameIndex(0);
+        setDate(nextDate);
+      }
+    } finally {
       loadingRef.current = false;
     }
   }, [date]);
@@ -157,18 +158,20 @@ function App() {
     }
   }, [hasPermission]);
 
+  // Initial load only — runs once when permission granted
+  const initialLoadRef = useRef(false);
   useEffect(() => {
     if (!hasPermission) return;
-    // Skip if loadPrevDay/loadNextDay already populated frames for this date
-    if (loadingRef.current) return;
+    if (initialLoadRef.current) return;
+    initialLoadRef.current = true;
     getTimeline(date).then((f) => {
-      // Don't wipe existing frames if the fetch returns empty (DB race, deleted file)
-      if (f.length === 0 && frames.length > 0) return;
-      setFrames(f);
-      if (f.length > 0) setFrameIndex(f.length - 1);
+      if (f.length > 0) {
+        setFrames(f);
+        setFrameIndex(f.length - 1);
+      }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date, hasPermission]);
+  }, [hasPermission]);
 
   useEffect(() => {
     if (!hasPermission) return;
@@ -332,10 +335,15 @@ function App() {
         }
 
         // Sync audio recording state from backend (source of truth)
-        try {
-          const rec = await invoke("is_audio_recording");
-          setAudioRecording(!!rec);
-        } catch {}
+        // BUT: don't override for 3s after a manual toggle — backend lags
+        // between stop_audio and ffmpeg actually dying, and we don't want
+        // the poll flipping the button back on.
+        if (Date.now() - lastMicToggleRef.current > 3000) {
+          try {
+            const rec = await invoke("is_audio_recording");
+            setAudioRecording(!!rec);
+          } catch {}
+        }
 
         // Session-based transcript: clear when start_ts changes OR when
         // transitioning active ↔ inactive
@@ -775,19 +783,20 @@ function App() {
 
         {/* Mic toggle — always reflects backend truth */}
         <button onClick={async () => {
+          lastMicToggleRef.current = Date.now(); // poll won't override for 3s
           // Unconditionally stop if currently recording, else start
           if (audioRecording) {
+            setAudioRecording(false); // optimistic update first
             await invoke("stop_audio");
-            setAudioRecording(false);
-            // Also suppress auto-restart for this meeting session
             setMicSuppressedSession(true);
           } else {
+            setAudioRecording(true); // optimistic update first
             try {
               await invoke("start_audio");
-              setAudioRecording(true);
               setMicSuppressedSession(false);
             } catch (e) {
               console.error("start_audio failed", e);
+              setAudioRecording(false); // rollback on failure
             }
           }
         }} style={{
@@ -886,8 +895,10 @@ function App() {
         for (let i = 0; i < firstDay; i++) days.push(null);
         for (let d = 1; d <= daysInMonth; d++) days.push(d);
 
-        const jumpToDate = async (day: number, hour: number) => {
+        const handleJumpToDate = async (day: number, hour: number) => {
           const dateStr = `${y}-${String(m + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+          if (loadingRef.current) return;
+          loadingRef.current = true;
           try {
             const newFrames = await getTimeline(dateStr);
             if (newFrames.length > 0) {
@@ -901,8 +912,10 @@ function App() {
                 if (diff < minDiff) { minDiff = diff; closestIdx = i; }
               });
               setFrameIndex(closestIdx);
+              setDate(dateStr); // keep date state in sync
             }
           } catch {}
+          finally { loadingRef.current = false; }
           setShowDatePicker(false);
         };
 
@@ -946,7 +959,7 @@ function App() {
                     if (d === null) return <div key={i} />;
                     const isToday = d === today.getDate() && m === today.getMonth() && y === today.getFullYear();
                     return (
-                      <button key={i} onClick={() => jumpToDate(d, 12)} style={{
+                      <button key={i} onClick={() => handleJumpToDate(d, 12)} style={{
                         width: 30, height: 30, borderRadius: 15, border: "none",
                         background: isToday ? "#007AFF" : "transparent",
                         color: isToday ? "white" : "rgba(255,255,255,0.8)",
@@ -962,7 +975,7 @@ function App() {
                 {Array.from({ length: 24 }, (_, h) => (
                   <button key={h} onClick={() => {
                     const d = currentFrame ? new Date(currentFrame.timestamp / 1000).getDate() : today.getDate();
-                    jumpToDate(d, h);
+                    handleJumpToDate(d, h);
                   }} style={{
                     display: "block", width: "100%", padding: "6px 8px", border: "none",
                     background: "transparent", color: "rgba(255,255,255,0.6)", fontSize: 12,
