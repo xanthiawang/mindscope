@@ -234,9 +234,9 @@ fn gather_context(query: &Option<String>, hours: u32) -> String {
     context
 }
 
-/// Call Claude CLI
+/// Call Claude CLI inside the MindScope vault (picks up CLAUDE.md + skills)
 fn call_claude(prompt: &str) -> Result<String, String> {
-    let vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
+    let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
     let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
 
     let result = std::process::Command::new("/opt/homebrew/bin/claude")

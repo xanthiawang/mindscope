@@ -13,6 +13,6 @@ pub mod panel;
 pub mod whisper;
 pub mod pipes;
 pub mod vault_sync;
-pub mod cortex;
+pub mod synapse;
 // Old storage module kept for backward compat during migration
 pub mod storage;

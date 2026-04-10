@@ -1,12 +1,14 @@
-//! Cortex module — ports Agentic Cortex into MindScope.
+//! Synapse module — MindScope's background AI knowledge loop.
 //!
 //! Responsibilities:
-//! - Bootstrap: on first run, seed ~/.mindscope/cortex/ and ~/.mindscope/vault/ with
-//!   skill definitions, CLAUDE.md, and working-memory template from app resources.
+//! - Bootstrap: on first run, seed ~/.mindscope/synapse/ and ~/.mindscope/vault/
+//!   with skill definitions, CLAUDE.md, and working-memory template from app
+//!   resources.
 //! - Background loop: periodically invoke Claude CLI in the vault directory to
-//!   run the command-center skill, which updates _working-memory.md based on
-//!   recent screen activity + audio transcripts + meeting notes.
-//! - Manual trigger: Tauri command for on-demand updates.
+//!   refresh _working-memory.md based on recent screen activity + audio
+//!   transcripts + meeting notes.
+//! - Manual trigger: Tauri command for on-demand updates (called from Brief
+//!   panel's Refresh button).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,51 +17,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-static CORTEX_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
-static CORTEX_IS_SYNCING: AtomicBool = AtomicBool::new(false);
+static SYNAPSE_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+static SYNAPSE_IS_SYNCING: AtomicBool = AtomicBool::new(false);
 
-/// Returns ~/.mindscope/cortex/ — where skills, CLAUDE.md, and .claude/ live
-fn cortex_dir() -> PathBuf {
-    dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("cortex")
+/// Returns ~/.mindscope/synapse/ — where skills, CLAUDE.md, and .claude/ live
+fn synapse_dir() -> PathBuf {
+    dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("synapse")
 }
 
-/// Returns ~/.mindscope/vault/ — the user's vault (working memory, meetings, etc.)
+/// Returns ~/.mindscope/vault/ — the user's vault (working memory, meetings)
 fn vault_dir() -> PathBuf {
     dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault")
 }
 
 /// Find the bundled resources directory.
-/// In a built app: MindScope.app/Contents/Resources/resources/cortex/
-/// In dev: src-tauri/resources/cortex/
+/// In a built app: MindScope.app/Contents/Resources/resources/synapse/
+/// In dev: src-tauri/resources/synapse/
 fn bundled_resources() -> Option<PathBuf> {
-    // Try app bundle path first
     if let Ok(exe) = std::env::current_exe() {
-        // exe = .../MindScope.app/Contents/MacOS/mindscope
         if let Some(macos_dir) = exe.parent() {
             if let Some(contents_dir) = macos_dir.parent() {
-                let resources = contents_dir.join("Resources").join("resources").join("cortex");
-                if resources.exists() {
-                    return Some(resources);
-                }
-                // Tauri 2 sometimes uses a different structure
-                let alt = contents_dir.join("Resources").join("cortex");
-                if alt.exists() {
-                    return Some(alt);
-                }
+                let resources = contents_dir.join("Resources").join("resources").join("synapse");
+                if resources.exists() { return Some(resources); }
+                let alt = contents_dir.join("Resources").join("synapse");
+                if alt.exists() { return Some(alt); }
             }
         }
     }
-
-    // Dev fallback
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("cortex");
-    if dev.exists() {
-        return Some(dev);
-    }
-
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("synapse");
+    if dev.exists() { return Some(dev); }
     None
 }
 
-/// Recursively copy a directory tree, skipping files that already exist at the destination.
+/// Recursively copy a directory tree, skipping files that already exist.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !src.exists() { return Ok(()); }
     fs::create_dir_all(dst)?;
@@ -76,44 +66,50 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Bootstrap the cortex directory on first run.
+/// Bootstrap the synapse directory on first run.
 /// Copies skills, CLAUDE.md, and seeds working memory if missing.
+/// Also migrates from legacy ~/.mindscope/cortex/ if it exists (previous name).
 /// Safe to call every startup — won't overwrite existing user edits.
 pub fn bootstrap() {
+    // Migrate legacy cortex directory if it exists
+    let legacy = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("cortex");
+    if legacy.exists() {
+        let _ = fs::remove_dir_all(&legacy);
+        log::info!("MindScope synapse: removed legacy cortex directory");
+    }
+
     let bundled = match bundled_resources() {
         Some(p) => p,
         None => {
-            log::warn!("MindScope cortex: bundled resources not found");
+            log::warn!("MindScope synapse: bundled resources not found");
             return;
         }
     };
 
-    let cortex = cortex_dir();
+    let synapse = synapse_dir();
     let vault = vault_dir();
 
-    // Create cortex directory structure
-    let _ = fs::create_dir_all(&cortex);
+    let _ = fs::create_dir_all(&synapse);
     let _ = fs::create_dir_all(&vault);
 
-    // Copy skills → ~/.mindscope/cortex/.claude/skills/
-    // (Claude CLI reads skills from .claude/skills/ in cwd)
-    let claude_skills = cortex.join(".claude").join("skills");
+    // Copy skills → ~/.mindscope/synapse/.claude/skills/
+    let claude_skills = synapse.join(".claude").join("skills");
     let _ = fs::create_dir_all(&claude_skills);
     let src_skills = bundled.join("skills");
     if src_skills.exists() {
         if let Err(e) = copy_tree(&src_skills, &claude_skills) {
-            log::warn!("MindScope cortex: failed to copy skills: {}", e);
+            log::warn!("MindScope synapse: failed to copy skills: {}", e);
         }
     }
 
-    // Copy CLAUDE.md → ~/.mindscope/cortex/CLAUDE.md (Claude CLI reads from cwd)
+    // Copy CLAUDE.md into synapse dir
     let src_claude_md = bundled.join("CLAUDE.md");
-    let dst_claude_md = cortex.join("CLAUDE.md");
+    let dst_claude_md = synapse.join("CLAUDE.md");
     if src_claude_md.exists() && !dst_claude_md.exists() {
         let _ = fs::copy(&src_claude_md, &dst_claude_md);
     }
 
-    // Also symlink (or copy) CLAUDE.md into vault dir so cortex loop has access
+    // Copy CLAUDE.md into vault dir so Claude CLI running there picks it up
     let vault_claude_md = vault.join("CLAUDE.md");
     if src_claude_md.exists() && !vault_claude_md.exists() {
         let _ = fs::copy(&src_claude_md, &vault_claude_md);
@@ -125,15 +121,27 @@ pub fn bootstrap() {
         let wm_src = bundled.join("seed-vault").join("_working-memory.md");
         if wm_src.exists() {
             let _ = fs::copy(&wm_src, &wm_dst);
-            log::info!("MindScope cortex: seeded _working-memory.md");
+            log::info!("MindScope synapse: seeded _working-memory.md");
         }
     }
 
-    // Link skills into vault/.claude/skills so Claude CLI running in vault finds them
-    let vault_claude_skills_dir = vault.join(".claude").join("skills");
-    let _ = fs::create_dir_all(&vault.join(".claude"));
+    // Link skills into vault/.claude/skills for Claude CLI in vault cwd
+    let vault_claude_dir = vault.join(".claude");
+    let vault_claude_skills_dir = vault_claude_dir.join("skills");
+    let _ = fs::create_dir_all(&vault_claude_dir);
+
+    // Remove stale symlink pointing at legacy cortex path
+    if let Ok(meta) = fs::symlink_metadata(&vault_claude_skills_dir) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&vault_claude_skills_dir) {
+                if target.to_string_lossy().contains("cortex") {
+                    let _ = fs::remove_file(&vault_claude_skills_dir);
+                }
+            }
+        }
+    }
+
     if !vault_claude_skills_dir.exists() && src_skills.exists() {
-        // Symlink to cortex's skills directory to keep single source of truth
         #[cfg(unix)]
         {
             let _ = std::os::unix::fs::symlink(&claude_skills, &vault_claude_skills_dir);
@@ -144,56 +152,48 @@ pub fn bootstrap() {
         }
     }
 
-    log::info!("MindScope cortex: bootstrap complete at {:?}", cortex);
+    log::info!("MindScope synapse: bootstrap complete at {:?}", synapse);
 }
 
-/// Run the cortex update loop in a background thread.
+/// Run the synapse update loop in a background thread.
 /// Every 30 minutes, ask Claude CLI to refresh _working-memory.md.
-pub fn start_cortex_loop() {
-    if CORTEX_SYNC_RUNNING.load(Ordering::Relaxed) { return; }
-    CORTEX_SYNC_RUNNING.store(true, Ordering::Relaxed);
+pub fn start_synapse_loop() {
+    if SYNAPSE_LOOP_RUNNING.load(Ordering::Relaxed) { return; }
+    SYNAPSE_LOOP_RUNNING.store(true, Ordering::Relaxed);
 
     thread::spawn(|| {
-        // Initial delay so we don't hammer Claude right at startup
         thread::sleep(Duration::from_secs(120));
-
         loop {
-            if let Err(e) = run_cortex_update() {
-                log::warn!("MindScope cortex loop error: {}", e);
+            if let Err(e) = run_synapse_update() {
+                log::warn!("MindScope synapse loop error: {}", e);
             }
-            // Sleep 30 minutes between updates
             thread::sleep(Duration::from_secs(30 * 60));
         }
     });
 
-    log::info!("MindScope cortex: background loop started (30min cadence)");
+    log::info!("MindScope synapse: background loop started (30min cadence)");
 }
 
-/// One cortex update pass.
-/// Calls `claude -p "..."` with cwd set to the vault directory so it picks up
-/// CLAUDE.md + .claude/skills/.
-pub fn run_cortex_update() -> Result<String, String> {
-    if CORTEX_IS_SYNCING.load(Ordering::Relaxed) {
-        return Err("cortex update already in progress".into());
+/// One synapse update pass. Called by the loop and by the manual Refresh button.
+pub fn run_synapse_update() -> Result<String, String> {
+    if SYNAPSE_IS_SYNCING.load(Ordering::Relaxed) {
+        return Err("synapse update already in progress".into());
     }
-    CORTEX_IS_SYNCING.store(true, Ordering::Relaxed);
-
-    let result = do_cortex_update();
-
-    CORTEX_IS_SYNCING.store(false, Ordering::Relaxed);
+    SYNAPSE_IS_SYNCING.store(true, Ordering::Relaxed);
+    let result = do_synapse_update();
+    SYNAPSE_IS_SYNCING.store(false, Ordering::Relaxed);
     result
 }
 
-fn do_cortex_update() -> Result<String, String> {
+fn do_synapse_update() -> Result<String, String> {
     let vault = vault_dir();
     if !vault.exists() {
         return Err("vault directory does not exist".into());
     }
 
-    // Check if claude CLI is available
-    let claude_path = find_claude_cli().ok_or("Claude CLI not found — install via `brew install claude`")?;
+    let claude_path = find_claude_cli()
+        .ok_or("Claude CLI not found — install via `brew install claude`")?;
 
-    // Gather a compact activity summary to inject into the prompt
     let activity = gather_recent_activity();
 
     let prompt = format!(
@@ -213,7 +213,7 @@ fn do_cortex_update() -> Result<String, String> {
         activity
     );
 
-    log::info!("MindScope cortex: invoking Claude CLI in {:?}", vault);
+    log::info!("MindScope synapse: invoking Claude CLI in {:?}", vault);
 
     let output = Command::new(&claude_path)
         .args(["-p", &prompt])
@@ -224,7 +224,7 @@ fn do_cortex_update() -> Result<String, String> {
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        log::info!("MindScope cortex: update complete");
+        log::info!("MindScope synapse: update complete");
         Ok(stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -232,7 +232,6 @@ fn do_cortex_update() -> Result<String, String> {
     }
 }
 
-/// Locate the Claude CLI binary
 fn find_claude_cli() -> Option<PathBuf> {
     let candidates = [
         "/opt/homebrew/bin/claude",
@@ -243,18 +242,13 @@ fn find_claude_cli() -> Option<PathBuf> {
         let p = PathBuf::from(path);
         if p.exists() { return Some(p); }
     }
-    // Try PATH via `which`
     if let Ok(out) = Command::new("which").arg("claude").output() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() {
-            return Some(PathBuf::from(s));
-        }
+        if !s.is_empty() { return Some(PathBuf::from(s)); }
     }
     None
 }
 
-/// Build a compact activity summary for injection into the cortex prompt.
-/// Uses last 2 hours of frames + any meeting segments from today.
 fn gather_recent_activity() -> String {
     use std::collections::HashMap;
     use super::db;
@@ -273,7 +267,6 @@ fn gather_recent_activity() -> String {
 
     let recent: Vec<_> = frames.iter().filter(|f| f.timestamp >= cutoff).collect();
 
-    // App time breakdown
     let mut app_counts: HashMap<String, u64> = HashMap::new();
     for f in &recent {
         if f.app_name.is_empty() || f.app_name == "Unknown" { continue; }
@@ -285,7 +278,6 @@ fn gather_recent_activity() -> String {
         .collect();
     apps.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // Collect sample OCR snippets
     let mut ocr_samples: Vec<String> = Vec::new();
     for f in recent.iter().rev().take(20) {
         if f.ocr_text.len() > 30 {
@@ -305,7 +297,6 @@ fn gather_recent_activity() -> String {
         out.push_str(&format!("- {}\n", s));
     }
 
-    // Include today's meeting session transcripts (brief)
     let audio_segments = super::audio::load_audio_segments(&date);
     if !audio_segments.is_empty() {
         out.push_str("\n## Meeting Transcripts (today)\n");
@@ -319,7 +310,7 @@ fn gather_recent_activity() -> String {
     out
 }
 
-/// Check if cortex is currently syncing (for UI indicators).
+/// Check if synapse is currently syncing (for UI indicators).
 pub fn is_syncing() -> bool {
-    CORTEX_IS_SYNCING.load(Ordering::Relaxed)
+    SYNAPSE_IS_SYNCING.load(Ordering::Relaxed)
 }

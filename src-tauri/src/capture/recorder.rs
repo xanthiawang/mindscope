@@ -505,7 +505,8 @@ fn generate_meeting_vault(start_ts: i64, end_ts: i64, app_name: &str, window_nam
 
 /// Call Claude CLI, return response or None
 fn call_claude_cli(prompt: &str) -> Option<String> {
-    let vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
+    // Run Claude inside the MindScope vault so it picks up CLAUDE.md + skills
+    let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
     let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
     let output = std::process::Command::new("/opt/homebrew/bin/claude")
         .args(["-p", prompt])

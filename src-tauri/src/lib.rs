@@ -192,18 +192,18 @@ fn hide_window(app: tauri::AppHandle) {
     }
 }
 
-/// Manually trigger a cortex update (refresh working memory via Claude CLI).
+/// Manually trigger a synapse update (refresh working memory via Claude CLI).
 #[tauri::command]
-async fn cortex_update() -> Result<String, String> {
-    tokio::task::spawn_blocking(|| capture::cortex::run_cortex_update())
+async fn synapse_update() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| capture::synapse::run_synapse_update())
         .await
         .map_err(|e| format!("task join error: {}", e))?
 }
 
-/// Check if cortex is currently syncing.
+/// Check if synapse is currently syncing.
 #[tauri::command]
-fn cortex_is_syncing() -> bool {
-    capture::cortex::is_syncing()
+fn synapse_is_syncing() -> bool {
+    capture::synapse::is_syncing()
 }
 
 /// Hide all UI — closes panels and hides the window, but keeps background
@@ -401,19 +401,19 @@ fn get_ocr_regions(image_path: String) -> Vec<capture::ocr::OcrRegion> {
     }
 }
 
-// --- AI (Claude CLI / Agentic Cortex) ---
+// --- AI (Claude CLI via Synapse vault) ---
 
-/// Call Claude CLI with a prompt — uses Agentic Cortex's CLAUDE.md, skills, and memory
-/// Falls back gracefully if claude CLI is not installed
+/// Call Claude CLI with a prompt — runs inside the MindScope vault directory
+/// so Claude picks up the bundled CLAUDE.md, skills, and vault knowledge.
+/// Falls back gracefully if claude CLI is not installed.
 #[tauri::command]
 async fn ask_ai(prompt: String) -> Result<String, String> {
     use std::process::Command;
 
-    // Use agentic-cortex-vault as working dir (Claude gets CLAUDE.md, skills, memory)
-    // Also pass MindScope vault path so Claude can reference meeting notes, people, projects
-    let ac_vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
+    // Use the MindScope vault as working dir — it contains CLAUDE.md, .claude/skills/,
+    // meeting notes, people, and working memory (all set up by synapse::bootstrap()).
     let ms_vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
-    let cwd = if ac_vault.exists() { ac_vault } else { dirs_next::home_dir().unwrap_or_default() };
+    let cwd = if ms_vault.exists() { ms_vault.clone() } else { dirs_next::home_dir().unwrap_or_default() };
 
     // Enrich prompt with vault context if relevant
     let enriched_prompt = if ms_vault.exists() {
@@ -676,13 +676,13 @@ pub fn run() {
             // Start vault auto-sync loop (hourly working memory + daily journal)
             capture::vault_sync::start_vault_sync_loop();
 
-            // Bootstrap cortex — copies skills, CLAUDE.md, seed working memory
+            // Bootstrap synapse — copies skills, CLAUDE.md, seed working memory
             // on first run. Safe to call every startup (won't overwrite edits).
-            capture::cortex::bootstrap();
+            capture::synapse::bootstrap();
 
-            // Start cortex background loop — every 30 min, refresh working memory
+            // Start synapse background loop — every 30 min, refresh working memory
             // via Claude CLI running against ~/.mindscope/vault/
-            capture::cortex::start_cortex_loop();
+            capture::synapse::start_synapse_loop();
 
             // Auto-start screen recording only
             // Audio recording is disabled by default — it triggers
@@ -786,8 +786,8 @@ pub fn run() {
             list_projects,
             hide_window,
             quit_app,
-            cortex_update,
-            cortex_is_syncing,
+            synapse_update,
+            synapse_is_syncing,
             expand_bar,
             collapse_bar,
             set_clickthrough,

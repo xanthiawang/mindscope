@@ -1,4 +1,8 @@
-//! Vault auto-sync — connects screen recording data to the Agentic Cortex knowledge vault.
+//! Vault auto-sync — connects screen recording data to the MindScope knowledge vault.
+//!
+//! Works in tandem with the Synapse module (`synapse.rs`): this file handles
+//! incremental updates from raw data (frames, audio segments), while Synapse
+//! runs the AI loop that enriches them with semantic context.
 //!
 //! Functions:
 //! - generate_daily_brief() — reads vault state + recent frames for a quick summary
@@ -21,16 +25,13 @@ use super::recorder;
 // Guard: only one sync loop thread at a time
 static SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Find the vault directory — tries ~/.mindscope/vault/ first, then ~/agentic-cortex-vault/
+/// Find the MindScope vault directory (~/.mindscope/vault/).
+/// Created by synapse::bootstrap() on first launch.
 fn vault_dir() -> Option<PathBuf> {
     let home = dirs_next::home_dir()?;
     let ms = home.join(".mindscope").join("vault");
     if ms.exists() {
         return Some(ms);
-    }
-    let ac = home.join("agentic-cortex-vault");
-    if ac.exists() {
-        return Some(ac);
     }
     None
 }
@@ -90,7 +91,7 @@ pub fn generate_daily_brief() -> String {
     }
 
     // ─── Section 4: Focus — auto-inferred from recent activity ───
-    // 1. If _working-memory.md exists (agentic-cortex users), read it
+    // 1. If _working-memory.md exists (seeded by synapse), read it
     // 2. Otherwise, use Claude CLI to infer Focus from recent screen activity
     let wm_path = ms_vault.join("_working-memory.md");
     let mut focus_written = false;
@@ -693,9 +694,10 @@ fn recent_app_summary(hours: u64) -> String {
         .join(", ")
 }
 
-/// Call Claude CLI with a prompt.
+/// Call Claude CLI with a prompt. Runs inside the MindScope vault so Claude
+/// picks up the bundled CLAUDE.md + .claude/skills/ from synapse bootstrap.
 fn call_claude(prompt: &str) -> Option<String> {
-    let vault = dirs_next::home_dir()?.join("agentic-cortex-vault");
+    let vault = dirs_next::home_dir()?.join(".mindscope").join("vault");
     let cwd = if vault.exists() {
         vault
     } else {

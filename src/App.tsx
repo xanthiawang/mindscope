@@ -1235,7 +1235,33 @@ function App() {
               )}
             </div>
             <div style={{ padding: "8px 16px", borderTop: "1px solid rgba(0,0,0,0.06)", display: "flex", justifyContent: "flex-end" }}>
-              <button onClick={() => { setBriefText(""); getDailyBrief().then(setBriefText).catch(() => setBriefText("Unable to load.")); }} style={{
+              <button onClick={async () => {
+                setBriefText("Refreshing...");
+                // Kick off synapse update in the background (don't block UI)
+                invoke("synapse_update").catch(() => {});
+                // Re-fetch brief immediately (shows old data)
+                try {
+                  const b = await getDailyBrief();
+                  setBriefText(b);
+                } catch {
+                  setBriefText("Unable to load.");
+                }
+                // Poll for synapse completion, then re-fetch brief once more
+                const poll = async () => {
+                  for (let i = 0; i < 60; i++) { // up to 60s
+                    await new Promise((r) => setTimeout(r, 1000));
+                    try {
+                      const syncing = await invoke<boolean>("synapse_is_syncing");
+                      if (!syncing) {
+                        const fresh = await getDailyBrief();
+                        setBriefText(fresh);
+                        return;
+                      }
+                    } catch {}
+                  }
+                };
+                poll();
+              }} style={{
                 background: "rgba(0,0,0,0.05)", border: "none", borderRadius: 100, padding: "4px 12px", fontSize: 11, color: "#1d1d1f", cursor: "pointer",
               }}>Refresh</button>
             </div>
