@@ -80,13 +80,8 @@ fn is_recording(state: State<'_, ManagedState>) -> bool {
 
 #[tauri::command]
 fn resize_to_bar(app: tauri::AppHandle) {
+    // Window is always 640px tall; just reassert bar mode window level + behavior
     if let Some(window) = app.get_webview_window("main") {
-        let screen = get_main_screen();
-        let bar_height = 70.0;
-        // screen.y + screen.h = bottom of visible area (above Dock)
-        let bar_y = screen.y + screen.h - bar_height;
-        let _ = window.set_size(tauri::LogicalSize::new(screen.w, bar_height));
-        let _ = window.set_position(tauri::LogicalPosition::new(screen.x, bar_y));
         let _ = window.set_always_on_top(true);
         panel::configure_bar_mode(&window);
     }
@@ -159,28 +154,17 @@ fn resize_to_search(app: tauri::AppHandle) {
     let _ = app;
 }
 
-/// Expand bar window to show panels (search, settings, AI, brief, etc.)
+/// Expand bar — now a no-op because the window is permanently 640px tall.
+/// Kept for backward compatibility with the frontend bindings.
 #[tauri::command]
-fn expand_bar(app: tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let screen = get_main_screen();
-        let expanded_height = 600.0;
-        let y = screen.y + screen.h - expanded_height;
-        let _ = window.set_size(tauri::LogicalSize::new(screen.w, expanded_height));
-        let _ = window.set_position(tauri::LogicalPosition::new(screen.x, y));
-    }
+fn expand_bar(_app: tauri::AppHandle) {
+    // No resize needed — window is always tall enough to show panels
 }
 
-/// Collapse back to 70px bar
+/// Collapse bar — no-op for the same reason as expand_bar.
 #[tauri::command]
-fn collapse_bar(app: tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let screen = get_main_screen();
-        let bar_height = 70.0;
-        let y = screen.y + screen.h - bar_height;
-        let _ = window.set_size(tauri::LogicalSize::new(screen.w, bar_height));
-        let _ = window.set_position(tauri::LogicalPosition::new(screen.x, y));
-    }
+fn collapse_bar(_app: tauri::AppHandle) {
+    // No resize needed
 }
 
 /// Hide the window reliably (clickthrough + hide + reset level)
@@ -699,15 +683,16 @@ pub fn run() {
                 // s.audio_recorder.start(); // Disabled: triggers permission dialog
             }
 
-            // Fullscreen transparent window on main screen, start hidden
-            // CSS handles all layout (bar at bottom, rewind fullscreen, etc.)
+            // Window is always a fixed 640px tall overlay anchored to bottom.
+            // The bar sits in the bottom 70px via CSS; panels render above it
+            // in the already-allocated transparent space. This eliminates the
+            // resize-jump when panels open/close.
             if let Some(window) = app.get_webview_window("main") {
                 let screen = get_main_screen();
-                // Use LogicalSize — Tauri handles scaling automatically
-                let bar_height = 70.0;
-                let bar_y = screen.y + screen.h - bar_height;
-                let _ = window.set_size(tauri::LogicalSize::new(screen.w, bar_height));
-                let _ = window.set_position(tauri::LogicalPosition::new(screen.x, bar_y));
+                let window_height = 640.0;
+                let window_y = screen.y + screen.h - window_height;
+                let _ = window.set_size(tauri::LogicalSize::new(screen.w, window_height));
+                let _ = window.set_position(tauri::LogicalPosition::new(screen.x, window_y));
                 panel::configure_bar_mode(&window);
                 let _ = window.hide();
             }

@@ -4,8 +4,9 @@ import SearchPanel from "./components/SearchPanel";
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, expandBar, collapseBar } from "./lib/commands";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
 import "./styles/globals.css";
 
@@ -170,6 +171,54 @@ function App() {
         setFrameIndex(f.length - 1);
       }
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasPermission]);
+
+  // Reset to today's latest frame whenever the window becomes visible/focused.
+  // This ensures reopening the app (after Esc or menu bar click) always starts
+  // from the present, not from whatever past day the user was rewinding to.
+  useEffect(() => {
+    if (!hasPermission) return;
+    const resetToToday = async () => {
+      if (loadingRef.current) return;
+      const now = new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+      loadingRef.current = true;
+      try {
+        const f = await getTimeline(today);
+        if (f.length > 0) {
+          setFrames(f);
+          setFrameIndex(f.length - 1);
+          setDate(today);
+          setMode("bar");
+          // Also clear any highlight state from a previous search jump
+          setHighlightQuery("");
+          setHighlightRegions([]);
+        }
+      } catch {}
+      finally { loadingRef.current = false; }
+    };
+
+    // Listen for Tauri window focus event (fires when window becomes visible)
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        const win = getCurrentWebviewWindow();
+        const u = await win.onFocusChanged(({ payload: focused }) => {
+          if (focused) resetToToday();
+        });
+        unlisten = u;
+      } catch {}
+    })();
+
+    // Also reset on browser visibility change as a fallback
+    const onVis = () => { if (!document.hidden) resetToToday(); };
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      if (unlisten) unlisten();
+      document.removeEventListener("visibilitychange", onVis);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasPermission]);
 
@@ -416,37 +465,25 @@ function App() {
 
   // Expand/collapse window when panels open/close
   const anyPanelOpen = showBrief || showAI || showSearch || showSettings || showDatePicker;
-  useEffect(() => {
-    if (mode !== "bar") return;
-    if (anyPanelOpen) {
-      expandBar().catch(() => {});
-    } else {
-      collapseBar().catch(() => {});
-    }
-  }, [anyPanelOpen, mode]);
+  // Note: expandBar/collapseBar are now no-ops on the backend side since
+  // the window is permanently 640px tall. Panels float above the bar via CSS.
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        // Layered Esc behavior:
-        // 1. If any panel/modal is open → close it
-        // 2. Else if in rewind mode → return to bar
-        // 3. Else (bar mode, nothing open) → fully quit the app
-        const anyOpen = showBrief || showAI || showSettings || showSearch || showDatePicker;
-        if (anyOpen) {
-          setShowBrief(false); setShowAI(false); setShowSettings(false);
-          setShowSearch(false); setShowDatePicker(false);
-          return;
-        }
-        if (mode !== "bar") {
-          setMode("bar");
-          return;
-        }
-        // Nothing to dismiss — full quit
-        invoke("quit_app").catch(() => {
-          // Fallback: hide if quit fails
-          hideWindow().catch(() => {});
-        });
+        // Single-press Esc = dismiss everything and hide UI
+        // All in one press: close panels, exit rewind, hide window
+        // Background recording/transcription keeps running.
+        setShowBrief(false);
+        setShowAI(false);
+        setShowSettings(false);
+        setShowSearch(false);
+        setShowDatePicker(false);
+        setMode("bar");
+        // Reset to today's latest frame so next show starts fresh
+        setHighlightQuery("");
+        setHighlightRegions([]);
+        hideWindow().catch(() => {});
         return;
       }
       if (mode === "bar" || mode === "rewind") {
