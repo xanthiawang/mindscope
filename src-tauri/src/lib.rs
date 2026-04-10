@@ -192,20 +192,15 @@ fn hide_window(app: tauri::AppHandle) {
     }
 }
 
-/// Fully quit MindScope — stops recording, audio, and exits the process.
+/// Hide all UI — closes panels and hides the window, but keeps background
+/// recording/transcription running. Does NOT kill child processes.
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    // Stop any running audio
-    if let Some(state) = app.try_state::<ManagedState>() {
-        let s = state.lock().unwrap();
-        s.recorder.stop();
-        s.audio_recorder.stop();
+    // Just hide the window — recording/ffmpeg/hevc continue in background
+    if let Some(window) = app.get_webview_window("main") {
+        panel::set_clickthrough(&window, true);
+        let _ = window.hide();
     }
-    // Kill any child ffmpeg processes
-    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
-    let _ = std::process::Command::new("pkill").args(["-f", "hevc_encoder"]).status();
-    // Exit the Tauri app cleanly
-    app.exit(0);
 }
 
 /// Set click-through on/off — frontend calls on mouseenter/mouseleave
