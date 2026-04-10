@@ -4,6 +4,8 @@
 
 MindScope runs silently in the background, capturing your screen activity and transforming it into searchable, structured knowledge — all processed locally on your Mac.
 
+It comes with a built-in personal knowledge OS (**Synapse**) that auto-maintains a living vault of projects, people, meetings, and daily journals — no separate setup required.
+
 ---
 
 ## How It Works
@@ -45,16 +47,17 @@ MindScope lives as a thin bar at the bottom of your screen. Click anywhere on th
 
 | Action | How |
 |--------|-----|
-| **Toggle recording audio** | Click the 🎙️ mic button (turns red + pulses when recording) |
-| **Open Daily Brief** | Click the 📋 clipboard icon |
+| **Toggle recording audio** | Click the mic button (turns red + pulses when recording) |
+| **Open Daily Brief** | Click the clipboard icon |
+| **Refresh Brief (run Synapse)** | Click "Refresh" in the Brief panel — triggers the AI loop |
 | **Ask AI** | Click the "Ask" field, type a question, press Enter |
-| **Enter Rewind mode** | Click the ⏪ rewind button or click anywhere on the timeline |
-| **Scrub timeline** | Click or drag anywhere on the bottom bar (full 24h visible) |
+| **Enter Rewind mode** | Click the rewind button or click anywhere on the timeline |
+| **Scrub timeline** | Move cursor over the timeline — time pill follows your mouse |
 | **Browse history** | Two-finger swipe on the timeline |
 | **Jump to date** | Click the time label for a calendar picker |
 | **Search** | In Rewind mode, click the search field |
-| **Settings** | Click the ⚙️ gear icon |
-| **Hide window** | Press `Esc` or click outside any panel |
+| **Settings** | Click the gear icon |
+| **Layered Esc** | 1st press closes panels → 2nd exits rewind → 3rd hides UI (background keeps running) |
 
 ### Timeline
 
@@ -168,14 +171,24 @@ Clicking the mic button during an auto-recorded meeting stops it and suppresses 
 ### AI Assistant
 - Chat + Transcript tabs in the AI panel
 - Natural-language Q&A over screen history + vault + meeting transcripts
-- Daily Brief with 5 sections (Now / Today / Recent Meetings / Focus / Tasks)
+- Daily Brief with 5 sections (Now / Today / Recent Meetings / Focus / Tasks / Stats)
 - Quick actions during meetings: "What should I say?", "Recap", "Follow-up questions"
+- Esc key — layered dismiss (close panels → exit rewind → hide UI, background keeps running)
+
+### Synapse — Built-in Personal Knowledge OS
+- **Zero-config**: no external install, no OAuth, no extra daemon. Ships bundled with MindScope.
+- **Auto-bootstrap** on first launch: seeds `~/.mindscope/synapse/` + `~/.mindscope/vault/` with skill definitions and a working-memory template
+- **Background AI loop**: every 30 minutes, Claude CLI reads the last 2 hours of screen activity + audio transcripts and refreshes `_working-memory.md` — Current Focus, Live Tasks, Today's Activity, Recent People
+- **Manual refresh**: the Refresh button in the Brief panel triggers a Synapse update on demand and polls until complete
+- **Wispr Flow / dictation filter**: Synapse ignores false-positive "mic in use" signals from dictation apps so recording only auto-starts for real meetings
+- **Works with Claude CLI only**: no API keys, no cloud storage, no external services
 
 ### Knowledge Vault
 - People profiles with auto-updated last contact dates
 - Meeting notes linked to attendees and projects
 - Daily journal auto-generated at end of day
 - Cross-references via wikilinks (Obsidian-compatible markdown)
+- Bundled skills for vault maintenance: `command-center`, `daily-journal`, `detect-people`, `dendron-add`, `dendron-query`, `sync/vault-updater`
 
 ### Automation (Pipes)
 - YAML-defined pipelines with cron schedules
@@ -197,23 +210,33 @@ All data lives under `~/.mindscope/`:
 ```
 ~/.mindscope/
 ├── data/
-│   ├── frames/         # Screenshots (JPEG, organized by date)
-│   ├── segments/       # HEVC video segments
-│   ├── audio/          # Audio chunks + transcripts, indexed by date
-│   └── mindscope.db    # SQLite database (frames, OCR, FTS5 index)
-├── vault/              # Knowledge vault (markdown)
-│   ├── meet.*.md         # Meeting notes
-│   ├── daily.journal.*.md  # Daily journals
-│   └── _working-memory.md  # Your current focus + tasks
+│   ├── frames/              # Screenshots (JPEG, organized by date)
+│   ├── segments/            # HEVC video segments
+│   ├── audio/               # Audio chunks + transcripts, indexed by date
+│   └── mindscope.db         # SQLite database (frames, OCR, FTS5 index)
+├── vault/                   # Knowledge vault (markdown)
+│   ├── CLAUDE.md              # Synapse system prompt (copy of bundled)
+│   ├── _working-memory.md     # Your current focus + tasks (auto-updated)
+│   ├── meet.*.md              # Meeting notes (auto-created from audio sessions)
+│   ├── daily.journal.*.md     # Daily journals (auto-generated at end of day)
+│   ├── user.*.md              # People profiles
+│   ├── proj.*.md              # Project files
+│   └── .claude/skills -> ../synapse/.claude/skills  (symlink)
+├── synapse/                 # Synapse knowledge OS (bundled resources)
+│   ├── CLAUDE.md              # System prompt
+│   └── .claude/skills/        # Skill definitions (command-center, etc.)
 ├── models/
-│   └── ggml-base.bin   # Multilingual Whisper model
-├── bin/                # Compiled Swift helpers
-│   ├── active_app
-│   ├── is_meeting
-│   ├── check_mic
-│   ├── topmost_window
-│   └── hevc_encoder
-└── pipes/              # Automation YAML configs
+│   └── ggml-base.bin        # Multilingual Whisper model (141 MB, auto-downloaded)
+├── bin/                     # Compiled Swift helpers
+│   ├── active_app             # Frontmost app detection
+│   ├── is_meeting             # Meeting + dictation filter
+│   ├── topmost_window         # Z-order window picker
+│   ├── capture_window         # ScreenCaptureKit wrapper
+│   ├── check_mic              # Mic permission check
+│   ├── hevc_encoder           # Streaming HEVC encoder
+│   └── frame_reader           # Video playback helper
+├── settings.json            # User preferences
+└── pipes/                   # Automation YAML configs
 ```
 
 Typical storage: **~400MB / day** with default settings.
