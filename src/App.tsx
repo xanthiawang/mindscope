@@ -399,10 +399,25 @@ function App() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        // One press does everything: close panels + reset mode + hide window
-        setShowBrief(false); setShowAI(false); setShowSettings(false); setShowSearch(false); setShowDatePicker(false);
-        if (mode !== "bar") setMode("bar");
-        hideWindow().catch(() => {});
+        // Layered Esc behavior:
+        // 1. If any panel/modal is open → close it
+        // 2. Else if in rewind mode → return to bar
+        // 3. Else (bar mode, nothing open) → fully quit the app
+        const anyOpen = showBrief || showAI || showSettings || showSearch || showDatePicker;
+        if (anyOpen) {
+          setShowBrief(false); setShowAI(false); setShowSettings(false);
+          setShowSearch(false); setShowDatePicker(false);
+          return;
+        }
+        if (mode !== "bar") {
+          setMode("bar");
+          return;
+        }
+        // Nothing to dismiss — full quit
+        invoke("quit_app").catch(() => {
+          // Fallback: hide if quit fails
+          hideWindow().catch(() => {});
+        });
         return;
       }
       if (mode === "bar" || mode === "rewind") {
