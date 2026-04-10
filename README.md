@@ -39,15 +39,9 @@ MindScope lives as a thin bar at the bottom of your screen. Click anywhere on th
 
 ### Bottom Bar at a Glance
 
-```
-[ 🕐 time ][ app ]               [ N frames ][ 🎙️ ][ 📋 ][ ✨ Ask ][ ⏪ ][ ⚙️ ]
-            └ current activity              │     │     │        │     │
-                                            │     │     │        │     └ Settings
-                                            │     │     │        └ Rewind mode
-                                            │     │     └ AI chat input
-                                            │     └ Daily Brief
-                                            └ Mic toggle (red pulse = recording)
-```
+<p align="center">
+  <img src="assets/ui.png" width="800" />
+</p>
 
 | Action | How |
 |--------|-----|
@@ -223,14 +217,6 @@ All data lives under `~/.mindscope/`:
 ```
 
 Typical storage: **~400MB / day** with default settings.
-
----
-
-## User Interface
-
-<p align="center">
-  <img src="assets/ui.png" width="800" />
-</p>
 
 ---
 
