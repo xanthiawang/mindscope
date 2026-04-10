@@ -22,10 +22,10 @@ description: "Personal OS / Digital Twin — orchestrates screenpipe intelligenc
 | Tier | File | Purpose | Refresh |
 |------|------|---------|---------|
 | **Working Memory** | `notes/_working-memory.md` | Hot index: today's focus, calendar, inbox, recent people, live tasks. | Every session |
-| **Context Model** | `memory/command-center.md` | Medium-term: follow-ups, momentum, collaborator state, decision patterns. | End of each session |
+| **Warm Memory** | `_warm-memory.md` | Medium-term: follow-ups, momentum, collaborator state, decision patterns. | End of each session |
 | **Vault** | `notes/*.md` | Long-term: person profiles, projects, topic notes, journals. | When data arrives |
 
-**Always read in this order**: Working Memory → Context Model → Vault (as needed).
+**Always read in this order**: Working Memory → Warm Memory → Vault (as needed).
 
 ## Source Sync Matrix
 
@@ -106,7 +106,7 @@ You are the Continuity Agent for {{USER_NAME}}'s command center briefing.
 
 **Steps**:
 1. Read notes/_working-memory.md (if it exists)
-2. Read memory/command-center.md (context model)
+2. Read _warm-memory.md (warm memory)
 3. Find the most recent daily.journal.*.md file and read its "State & Open Questions" and "Tasks" sections
 4. Extract:
    - Current focus areas
@@ -244,7 +244,7 @@ After all foreground agents return, compose the briefing:
 - [Open meeting action items >7 days]
 
 ## Strategic View
-- [Project momentum table from context model]
+- [Project momentum table from warm memory]
 - [Key deadlines approaching]
 - [Stale items needing triage (max 3)]
 
@@ -260,7 +260,7 @@ After all foreground agents return, compose the briefing:
 ### Step 4: Cache & Update
 
 1. Write briefing JSON to `.cache/cc-briefing-YYYY-MM-DD.json`
-2. Update `memory/command-center.md` with session date and any new follow-ups discovered
+2. Update `_warm-memory.md` with session date and any new follow-ups discovered
 3. Update `_working-memory.md` with standardized sync headers and new data:
 
 ```markdown
@@ -290,7 +290,7 @@ When the user asks something, match to the appropriate handler:
 
 | Pattern | Route | Risk |
 |---------|-------|------|
-| "What should I focus on?" | Priority analysis: context model + calendar + deadlines | Read-only |
+| "What should I focus on?" | Priority analysis: warm memory + calendar + deadlines | Read-only |
 | "What was I doing N hours ago?" | Query preprocessed screenpipe cache for that time window | Read-only |
 | "What did I discuss with X?" | Invoke `dendron-query` with person intent | Read-only |
 | "Draft a reply to X's email" | Read Gmail via MCP, draft in user's voice, **present for approval** | High-risk |
@@ -309,8 +309,8 @@ When the user asks something, match to the appropriate handler:
 
 When asked "Should I...?", "What should I prioritize?", or similar:
 
-1. **Gather context**: Read relevant vault notes, calendar, screenpipe activity, context model
-2. **Apply user's priorities**: From their priorities file, stated goals, decision patterns in context model
+1. **Gather context**: Read relevant vault notes, calendar, screenpipe activity, warm memory
+2. **Apply user's priorities**: From their priorities file, stated goals, decision patterns in warm memory
 3. **Reason transparently**: Show the factors considered, not just the conclusion
 4. **Present as recommendation**: "I'd recommend X because [reasons]. But consider Y if [condition]."
 5. **Never fabricate**: If data is missing, say so explicitly
@@ -318,7 +318,7 @@ When asked "Should I...?", "What should I prioritize?", or similar:
 ### Decision factors to weigh:
 - Calendar load (next 7 days)
 - Active deadlines (submissions, deliverables, applications)
-- Project momentum (from context model)
+- Project momentum (from warm memory)
 - Energy patterns (how many consecutive days on same task?)
 - Stated priorities (from priorities file and recent decisions)
 
@@ -342,7 +342,7 @@ Dispatch 3 parallel agents: (Person lookup, Past meetings, Recent activity).
 
 | Tier | Actions | Behavior |
 |------|---------|----------|
-| **Auto** | Update timestamps, mark tasks done, update context model, cache management, add progress notes | Execute silently, log in context model |
+| **Auto** | Update timestamps, mark tasks done, update warm memory, cache management, add progress notes | Execute silently, log in warm memory |
 | **Draft & Present** | Draft emails, create calendar events, archive projects, send messages, create new notes | Show draft, wait for approval |
 | **Read-only** | Queries, summaries, briefings, decision analysis, meeting prep | Always safe, no confirmation needed |
 
@@ -408,9 +408,9 @@ created: [existing-created]
 
 ---
 
-## Context Model Management
+## Warm Memory Management
 
-The context model (`memory/command-center.md`) persists across sessions.
+The warm memory (`_warm-memory.md`) persists across sessions.
 
 ### Auto-update (low-risk):
 - Session date and focus

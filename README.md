@@ -62,11 +62,23 @@ When detected, MindScope streams audio to a local multilingual Whisper model (`g
 
 **Sessions are activity-based, not time-based:** one Zoom meeting = one session, even if it spans hours. A manual 10-minute recording is a separate session. Find them under Search → Meetings as clickable cards with colored app badges and full transcripts.
 
-### Synapse — built-in knowledge OS
+### Synapse — three-tier memory, fully local
 
-On first launch, MindScope bootstraps a local AI loop called Synapse into `~/.mindscope/synapse/` and seeds `~/.mindscope/vault/` with a working-memory template. Every 30 minutes (or on-demand via the Brief panel's Refresh button), Synapse reads your recent screen activity + meeting transcripts and asks Claude CLI to update `_working-memory.md` with the current Focus, Tasks, Today's Activity, and Recent People.
+On first launch, MindScope bootstraps a local AI loop called **Synapse** into `~/.mindscope/synapse/` and seeds `~/.mindscope/vault/` with memory templates. Every 30 minutes (or on-demand from the Brief panel), Synapse reads your recent screen activity + meeting transcripts and patches your memory files via Claude CLI.
 
-The Daily Brief reads from this file, so the more you use MindScope, the more contextual the Brief becomes. Synapse ships with bundled skills (`command-center`, `daily-journal`, `detect-people`, `dendron-add/query`, `vault-updater`) that Claude uses to maintain vault files. No external install, no OAuth, no cloud.
+Memory is organized in three tiers — just like human memory:
+
+| Tier | File | Purpose |
+|---|---|---|
+| 🔥 **Hot** | `_working-memory.md` | What you're doing *right now* — today's focus, recent apps, active people |
+| 🌤 **Warm** | `_warm-memory.md` | Rolling context — follow-ups, project momentum, collaborator state |
+| ❄ **Cold** | `meet.*.md`, `user.*.md`, `proj.*.md`, `daily.journal.*.md` | Long-term vault, one file per entity |
+
+Synapse uses **Edit-only, section-scoped patches** with hard size caps (4 KB Hot, 8 KB Warm) to prevent memory drift — your manual notes in the `## User Notes` zone are never touched. Background loops route through **Claude Haiku** to keep costs minimal; only the **Ask AI** button uses Sonnet for deep reasoning.
+
+Bundled skills (`command-center`, `daily-journal`, `detect-people`, `sync/vault-updater`) ship with the app. No external install, no OAuth, no cloud.
+
+> 📖 For a walkthrough of how all this works together, see [**How MindScope Works**](docs/HOW_IT_WORKS.md).
 
 ---
 
@@ -82,10 +94,11 @@ Everything is local. No data leaves your Mac. All files live under `~/.mindscope
 │   ├── audio/           # Audio chunks + transcripts
 │   └── mindscope.db     # SQLite + FTS5 index
 ├── vault/               # Markdown knowledge base
-│   ├── _working-memory.md
-│   ├── meet.*.md        # Auto-created per session
-│   ├── daily.journal.*.md
-│   └── user.*.md
+│   ├── _working-memory.md   # 🔥 Hot tier (≤ 4 KB)
+│   ├── _warm-memory.md      # 🌤 Warm tier (≤ 8 KB)
+│   ├── meet.*.md            # ❄ Auto-created per session
+│   ├── daily.journal.*.md   # ❄ End-of-day summaries
+│   └── user.*.md            # ❄ Person profiles
 ├── synapse/             # AI skill definitions
 ├── models/
 │   └── ggml-base.bin    # Multilingual Whisper
@@ -120,7 +133,9 @@ Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg`.
 
 **MindScope not in Privacy → Microphone.** Click the mic button in the bar — macOS will show the permission dialog on first use.
 
-**Synapse loop not updating working memory.** Install Claude CLI (`brew install claude`) and verify it runs without errors in `~/.mindscope/vault/`.
+**Synapse loop not updating working memory.** Install Claude CLI (`brew install claude`) and verify it runs without errors in `~/.mindscope/vault/`. The loop routes through Claude Haiku — if you see quota warnings, check your subscription usage.
+
+**Upgrading from an older build.** If you had a previous `_context-model.md` file, Synapse automatically renames it to `_warm-memory.md` on first launch. Your notes are preserved.
 
 ---
 

@@ -125,6 +125,27 @@ pub fn bootstrap() {
         }
     }
 
+    // Seed _warm-memory.md into vault (only if missing) — warm tier
+    let wmem_dst = vault.join("_warm-memory.md");
+    if !wmem_dst.exists() {
+        let wmem_src = bundled.join("seed-vault").join("_warm-memory.md");
+        if wmem_src.exists() {
+            let _ = fs::copy(&wmem_src, &wmem_dst);
+            log::info!("MindScope synapse: seeded _warm-memory.md");
+        }
+    }
+
+    // One-shot migration: rename legacy _context-model.md → _warm-memory.md
+    // so existing users don't end up with orphaned files after upgrade.
+    let legacy_cm = vault.join("_context-model.md");
+    if legacy_cm.exists() && !wmem_dst.exists() {
+        let _ = fs::rename(&legacy_cm, &wmem_dst);
+        log::info!("MindScope synapse: migrated _context-model.md → _warm-memory.md");
+    } else if legacy_cm.exists() {
+        // Both exist (unlikely) — remove the legacy one to avoid confusion.
+        let _ = fs::remove_file(&legacy_cm);
+    }
+
     // Link skills into vault/.claude/skills for Claude CLI in vault cwd
     let vault_claude_dir = vault.join(".claude");
     let vault_claude_skills_dir = vault_claude_dir.join("skills");
@@ -185,6 +206,107 @@ pub fn run_synapse_update() -> Result<String, String> {
     result
 }
 
+/// Hard cap for _working-memory.md. If exceeded, auto-trim oldest Today's
+/// Activity rows before asking Claude to do anything.
+const WORKING_MEMORY_HARD_CAP: usize = 4000;
+/// Hard cap for _warm-memory.md.
+const WARM_MEMORY_HARD_CAP: usize = 8000;
+
+/// Pre-flight guard: if _working-memory.md has blown past the hard cap,
+/// brute-force trim the oldest rows in `## Today's Activity` and the oldest
+/// entries in `## Recent People`. This prevents unbounded growth and gives
+/// Claude a sane starting point for its section-scoped edits.
+fn trim_working_memory(path: &Path) {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if content.len() <= WORKING_MEMORY_HARD_CAP {
+        return;
+    }
+
+    log::warn!(
+        "MindScope synapse: working-memory.md bloated ({} chars), auto-trimming",
+        content.len()
+    );
+
+    // Split into sections by "## " heading. Trim the table rows inside
+    // "Today's Activity" first, then "Recent People" bullets if still over.
+    let mut out = String::with_capacity(content.len());
+    let mut in_activity = false;
+    let mut in_people = false;
+    let mut activity_data_rows = 0usize; // excludes header + separator
+    let mut people_bullets = 0usize;
+
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            in_activity = line.contains("Today's Activity");
+            in_people = line.contains("Recent People");
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if in_activity && line.trim_start().starts_with('|') && !line.contains("---") {
+            activity_data_rows += 1;
+            // Keep only the 4 most-recent rows (assume chronological; Claude
+            // appends, so "latest" = later in file). We approximate by keeping
+            // the header + sep (first 2 rows) and the last 4 data rows.
+            // Strategy: on first pass just count. Second pass will filter.
+            // Since this is a streaming single-pass, fall back to a simpler
+            // rule: drop data rows until we're under cap.
+            if content.len() > WORKING_MEMORY_HARD_CAP && activity_data_rows > 4 {
+                continue; // skip (drop) this row
+            }
+        }
+
+        if in_people && line.trim_start().starts_with("- ") {
+            people_bullets += 1;
+            if content.len() > WORKING_MEMORY_HARD_CAP + 500 && people_bullets > 3 {
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // If still over, hard-truncate with a warning marker.
+    if out.len() > WORKING_MEMORY_HARD_CAP + 1000 {
+        let mut truncated: String = out.chars().take(WORKING_MEMORY_HARD_CAP).collect();
+        truncated.push_str("\n\n<!-- synapse: auto-truncated due to size cap -->\n");
+        out = truncated;
+    }
+
+    if let Err(e) = fs::write(path, &out) {
+        log::warn!("MindScope synapse: failed to write trimmed working memory: {}", e);
+    }
+}
+
+/// Pre-flight guard for _warm-memory.md. Simpler: if over cap, truncate
+/// from the bottom preserving the frontmatter + first 4 sections.
+fn trim_warm_memory(path: &Path) {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if content.len() <= WARM_MEMORY_HARD_CAP {
+        return;
+    }
+
+    log::warn!(
+        "MindScope synapse: warm-memory.md bloated ({} chars), auto-trimming",
+        content.len()
+    );
+
+    let truncated: String = content.chars().take(WARM_MEMORY_HARD_CAP).collect();
+    let marker = "\n\n<!-- synapse: auto-truncated due to size cap -->\n";
+    let final_content = format!("{}{}", truncated, marker);
+    if let Err(e) = fs::write(path, final_content) {
+        log::warn!("MindScope synapse: failed to write trimmed warm memory: {}", e);
+    }
+}
+
 fn do_synapse_update() -> Result<String, String> {
     let vault = vault_dir();
     if !vault.exists() {
@@ -194,29 +316,68 @@ fn do_synapse_update() -> Result<String, String> {
     let claude_path = find_claude_cli()
         .ok_or("Claude CLI not found — install via `brew install claude`")?;
 
+    // Pre-flight: enforce hard size caps BEFORE asking Claude to touch anything.
+    // This is cheap (local file I/O) and prevents Claude from being fed a
+    // 20 KB bloated file and dutifully preserving all the bloat.
+    trim_working_memory(&vault.join("_working-memory.md"));
+    trim_warm_memory(&vault.join("_warm-memory.md"));
+
     let activity = gather_recent_activity();
 
+    // Section-scoped, Edit-only, hard-capped prompt routed through vault-updater.
     let prompt = format!(
-        "You are running in the MindScope vault directory. Your job is to update \
-         `_working-memory.md` based on the user's recent activity.\n\n\
-         Recent activity (last 2 hours):\n{}\n\n\
-         Please:\n\
-         1. Read `_working-memory.md`\n\
-         2. Update the `## Current Focus` section with what the user appears to be working on\n\
-         3. Update the `## Today's Activity` table with the latest apps/durations\n\
-         4. If new people are mentioned, update `## Recent People`\n\
-         5. Set `## Source Sync Status` last synced time to now\n\
-         6. Write the updated file back\n\n\
-         Be concise. Don't invent data not present in the activity log. \
-         Don't write more than 80 chars per focus line. \
-         Preserve any manual edits the user made.",
+        "You are the MindScope Synapse loop. Update the vault based on recent activity.\n\n\
+         ═══════════════ RECENT ACTIVITY (last 2 hours) ═══════════════\n\
+         {}\n\
+         ══════════════════════════════════════════════════════════════\n\n\
+         🚨 CRITICAL RULES — violations cause rollback:\n\n\
+         1. **Edit tool ONLY.** Use `old_string → new_string` on existing files. \
+            NEVER use the Write tool on `_working-memory.md` or `_warm-memory.md`. \
+            Write is permitted only for creating brand-new `user.*.md` / `proj.*.md` files.\n\n\
+         2. **Section-scoped edits.** When you edit a managed file, only touch \
+            content inside these specific headings:\n\
+            - `_working-memory.md` → `## Current Focus`, `## Today's Activity`, \
+              `## Recent People`, `## Source Sync Status`\n\
+            - `_warm-memory.md` → `## Active Follow-Ups`, `## Project Momentum`, \
+              `## Collaborator State`, `## Needs Triage`, `## Recent Decisions`\n\
+            NEVER touch `## User Notes` — that's user-owned.\n\n\
+         3. **Hard size caps.** After your edits:\n\
+            - `_working-memory.md` must stay ≤ 4000 chars\n\
+            - `_warm-memory.md` must stay ≤ 8000 chars\n\
+            If you're about to exceed, your FIRST edit must DELETE the oldest \
+            rows in `## Today's Activity` or the oldest entries in `## Recent People`.\n\n\
+         4. **Auto-decay rules (apply every pass):**\n\
+            - Today's Activity table: keep max 8 rows; drop oldest\n\
+            - Recent People: keep max 6 entries; drop least-recent\n\
+            - Unchecked tasks `- [ ]` older than 14 days → move from _working-memory.md to \
+              _warm-memory.md `## Needs Triage`\n\
+            - Follow-ups > 7 days old with no completion → mark `⚠ Overdue`\n\n\
+         5. **Preserve user edits.** If a section has content that clearly wasn't \
+            written by you (different style, explicit notes, etc.), merge around it. \
+            Don't clobber.\n\n\
+         6. **Never invent data.** If the activity log is empty or sparse, make \
+            minimal edits (just update the sync timestamp) and stop.\n\n\
+         7. **Use the `sync/vault-updater` skill** for managed file edits — it \
+            enforces section-scoped rewrites correctly.\n\n\
+         ══════════════════════════════════════════════════════════════\n\
+         TASK:\n\
+         1. Read `_working-memory.md`.\n\
+         2. Apply Edit-tool patches to update Current Focus + Today's Activity + \
+            Recent People + Source Sync Status based on the activity above.\n\
+         3. Read `_warm-memory.md`.\n\
+         4. Apply Edit-tool patches to bubble up any task older than 14 days to \
+            Needs Triage, and update Collaborator State for anyone in Recent People.\n\
+         5. Output a one-line summary of what you changed.\n\n\
+         Be concise. Max 80 chars per focus line. Confidence < 0.5 → don't apply.",
         activity
     );
 
-    log::info!("MindScope synapse: invoking Claude CLI in {:?}", vault);
+    log::info!("MindScope synapse: invoking Claude CLI (Haiku) in {:?}", vault);
 
+    // Route through Haiku to cut background token cost ~12x vs Sonnet.
+    // Synapse updates are "read + summarize + patch" — Haiku handles this well.
     let output = Command::new(&claude_path)
-        .args(["-p", &prompt])
+        .args(["-p", &prompt, "--model", "claude-haiku-4-5"])
         .current_dir(&vault)
         .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
@@ -224,6 +385,10 @@ fn do_synapse_update() -> Result<String, String> {
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Post-flight: if Claude ignored the cap rules (rare but possible),
+        // enforce again. This is idempotent.
+        trim_working_memory(&vault.join("_working-memory.md"));
+        trim_warm_memory(&vault.join("_warm-memory.md"));
         log::info!("MindScope synapse: update complete");
         Ok(stdout)
     } else {

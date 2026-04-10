@@ -696,6 +696,7 @@ fn recent_app_summary(hours: u64) -> String {
 
 /// Call Claude CLI with a prompt. Runs inside the MindScope vault so Claude
 /// picks up the bundled CLAUDE.md + .claude/skills/ from synapse bootstrap.
+/// Routes through Haiku — vault_sync is background summarization, not reasoning.
 fn call_claude(prompt: &str) -> Option<String> {
     let vault = dirs_next::home_dir()?.join(".mindscope").join("vault");
     let cwd = if vault.exists() {
@@ -704,7 +705,7 @@ fn call_claude(prompt: &str) -> Option<String> {
         dirs_next::home_dir()?
     };
     let output = std::process::Command::new("/opt/homebrew/bin/claude")
-        .args(["-p", prompt])
+        .args(["-p", prompt, "--model", "claude-haiku-4-5"])
         .current_dir(&cwd)
         .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
