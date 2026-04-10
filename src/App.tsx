@@ -84,6 +84,9 @@ function App() {
   const [pickerMonth, setPickerMonth] = useState(() => new Date());
   const [aiTab, setAiTab] = useState<"chat" | "transcript">("chat");
   const [meetingActive, setMeetingActive] = useState(false);
+  // Cursor position over timeline (for rewind mode time tooltip that follows mouse)
+  const [cursorX, setCursorX] = useState<number | null>(null);
+  const [cursorTimeLabel, setCursorTimeLabel] = useState<string>("");
   const [, setMeetingSessionStart] = useState<number>(0);
   const [audioRecording, setAudioRecording] = useState(false);
   const [, setMicSuppressedSession] = useState(false);
@@ -590,9 +593,33 @@ function App() {
 
   // === Rewind mode ===
   if (mode === "rewind") {
+    // Convert cursor X → time label (24h day scale)
+    const computeCursorTime = (clientX: number) => {
+      if (!timelineRef.current || frames.length === 0) return null;
+      const rect = timelineRef.current.getBoundingClientRect();
+      const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+      const ratio = x / rect.width;
+      const firstDate = new Date(frames[0].timestamp / 1000);
+      firstDate.setHours(0, 0, 0, 0);
+      const dayStart = firstDate.getTime();
+      const targetMs = dayStart + ratio * 24 * 3600 * 1000;
+      const d = new Date(targetMs);
+      const mon = d.toLocaleDateString("en-US", { month: "short" });
+      const day = d.getDate();
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      return { clientX: x + rect.left, label: `${mon} ${day} ${hh}:${mm}` };
+    };
+
     return (
       <div style={{ width: "100vw", height: "100vh", position: "relative", cursor: "default", background: "#000" }}
         onClick={() => { setMode("bar"); setHighlightQuery(""); setHighlightRegions([]); }}
+        onMouseMove={(e) => {
+          const res = computeCursorTime(e.clientX);
+          if (res) { setCursorX(res.clientX); setCursorTimeLabel(res.label); }
+          else setCursorX(null);
+        }}
+        onMouseLeave={() => setCursorX(null)}
       >
         <div style={{ position: "absolute", inset: 0, background: "#000" }} />
         {bgImageUrl && <img src={bgImageUrl} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: "brightness(0.9)", zIndex: 1 }} />}
@@ -635,9 +662,18 @@ function App() {
           </div>
         )}
 
-        {/* Time pill */}
-        <div style={{ position: "absolute", bottom: 108, left: `${scrubberPos}%`, transform: "translateX(-50%)", zIndex: 20 }}>
-          <div className="time-bubble">{rewindTimeLabel}</div>
+        {/* Time pill — follows cursor when hovering, otherwise sits at scrubber */}
+        <div style={{
+          position: "absolute",
+          bottom: 108,
+          ...(cursorX !== null
+            ? { left: cursorX, transform: "translateX(-50%)" }
+            : { left: `${scrubberPos}%`, transform: "translateX(-50%)" }),
+          zIndex: 20,
+          pointerEvents: "none",
+          transition: cursorX !== null ? "none" : "left 0.15s ease",
+        }}>
+          <div className="time-bubble">{cursorX !== null ? cursorTimeLabel : rewindTimeLabel}</div>
         </div>
 
         {/* Timeline */}
@@ -1191,6 +1227,10 @@ function BottomTimeline({ timelineRef, segments, frames, scrubberPos, onInteract
   onInteraction: (clientX: number) => void;
   onFrameStep: (delta: number) => void;
 }) {
+  // Hover state for time tooltip that follows the cursor
+  const [hoverX, setHoverX] = useState<number | null>(null);
+  const [hoverTime, setHoverTime] = useState<string>("");
+
   // Non-passive wheel listener for trackpad swipe
   useEffect(() => {
     const el = timelineRef.current;
@@ -1205,19 +1245,68 @@ function BottomTimeline({ timelineRef, segments, frames, scrubberPos, onInteract
     return () => el.removeEventListener("wheel", handler);
   });
 
+  // Convert cursor X → time label based on 24h day scale
+  const computeHoverTime = (clientX: number): { x: number; label: string } | null => {
+    const el = timelineRef.current;
+    if (!el || frames.length === 0) return null;
+    const rect = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    const ratio = x / rect.width;
+    const firstDate = new Date(frames[0].timestamp / 1000);
+    firstDate.setHours(0, 0, 0, 0);
+    const dayStart = firstDate.getTime();
+    const targetMs = dayStart + ratio * 24 * 3600 * 1000;
+    const d = new Date(targetMs);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return { x, label: `${hh}:${mm}` };
+  };
+
   return (
     <div ref={timelineRef} className="flex-1 relative" style={{ height: 18, cursor: "grab", touchAction: "none" }}
       onClick={(e) => onInteraction(e.clientX)}
+      onMouseMove={(e) => {
+        const res = computeHoverTime(e.clientX);
+        if (res) { setHoverX(res.x); setHoverTime(res.label); }
+      }}
+      onMouseLeave={() => { setHoverX(null); }}
       onMouseDown={(e) => {
         const el = e.currentTarget;
         el.style.cursor = "grabbing";
-        const move = (ev: MouseEvent) => { ev.preventDefault(); onInteraction(ev.clientX); };
+        const move = (ev: MouseEvent) => {
+          ev.preventDefault();
+          onInteraction(ev.clientX);
+          const res = computeHoverTime(ev.clientX);
+          if (res) { setHoverX(res.x); setHoverTime(res.label); }
+        };
         const up = () => { el.style.cursor = "grab"; window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
         window.addEventListener("mousemove", move);
         window.addEventListener("mouseup", up);
         onInteraction(e.clientX);
       }}
     >
+      {/* Time tooltip that follows the cursor */}
+      {hoverX !== null && (
+        <div style={{
+          position: "absolute",
+          left: hoverX,
+          bottom: 24,
+          transform: "translateX(-50%)",
+          background: "rgba(28, 28, 30, 0.92)",
+          color: "#fff",
+          fontSize: 11,
+          fontWeight: 600,
+          padding: "4px 8px",
+          borderRadius: 6,
+          pointerEvents: "none",
+          whiteSpace: "nowrap",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+          letterSpacing: 0.3,
+          zIndex: 100,
+        }}>
+          {hoverTime}
+        </div>
+      )}
       {/* App icons — hidden in bar mode (too small), shown in rewind */}
       <div style={{ position: "absolute", top: -18, left: 0, right: 0, height: 16, pointerEvents: "none", display: "none" }}>
         {segments.map((seg, i) => {
