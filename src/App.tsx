@@ -106,11 +106,15 @@ function App() {
     const prevDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     const prevFrames = await getTimeline(prevDate);
     if (prevFrames.length > 0) {
-      setDate(prevDate);
+      // Set frames BEFORE date so useEffect sees populated state
       setFrames(prevFrames);
-      setFrameIndex(prevFrames.length - 1); // start at the end (most recent of that day)
+      setFrameIndex(prevFrames.length - 1);
+      setDate(prevDate);
+      // Release lock after React has a chance to batch updates
+      setTimeout(() => { loadingRef.current = false; }, 100);
+    } else {
+      loadingRef.current = false;
     }
-    loadingRef.current = false;
   }, [date]);
 
   // Load next day when scrubbing past the right edge
@@ -118,18 +122,20 @@ function App() {
     if (loadingRef.current) return;
     const now = new Date();
     const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
-    if (date >= today) { loadingRef.current = false; return; } // can't go past today
+    if (date >= today) { return; } // can't go past today
     loadingRef.current = true;
     const d = new Date(date + "T12:00:00");
     d.setDate(d.getDate() + 1);
     const nextDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     const nextFrames = await getTimeline(nextDate);
     if (nextFrames.length > 0) {
-      setDate(nextDate);
       setFrames(nextFrames);
-      setFrameIndex(0); // start at the beginning
+      setFrameIndex(0);
+      setDate(nextDate);
+      setTimeout(() => { loadingRef.current = false; }, 100);
+    } else {
+      loadingRef.current = false;
     }
-    loadingRef.current = false;
   }, [date]);
 
   const bgImageUrl = (() => {
@@ -153,16 +159,27 @@ function App() {
 
   useEffect(() => {
     if (!hasPermission) return;
+    // Skip if loadPrevDay/loadNextDay already populated frames for this date
+    if (loadingRef.current) return;
     getTimeline(date).then((f) => {
+      // Don't wipe existing frames if the fetch returns empty (DB race, deleted file)
+      if (f.length === 0 && frames.length > 0) return;
       setFrames(f);
       if (f.length > 0) setFrameIndex(f.length - 1);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date, hasPermission]);
 
   useEffect(() => {
     if (!hasPermission) return;
+    // Only auto-refresh if viewing today (past days don't change)
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    if (date !== today) return;
     const t = setInterval(() => {
       getTimeline(date).then((f) => {
+        // Skip if nothing changed or fetch returned empty
+        if (f.length === 0) return;
         if (f.length !== frames.length) {
           setFrames(f);
           // Auto-follow latest if user was near the end
@@ -171,7 +188,8 @@ function App() {
       });
     }, 3000);
     return () => clearInterval(t);
-  }, [date, hasPermission]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, hasPermission, frames.length]);
 
   const segments = (() => {
     if (frames.length === 0) return [];
