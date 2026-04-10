@@ -116,3 +116,50 @@ MACOSX_DEPLOYMENT_TARGET=11.0 npx tauri build
 ## License
 
 MIT — Copyright (c) 2026 Zixin Wang
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    MindScope (Tauri 2)                    │
+├──────────────────────────────────────────────────────────┤
+│                                                          │
+│  Frontend (React/TypeScript)                             │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐ │
+│  │ Timeline │ │  Search  │ │    AI    │ │  Settings  │ │
+│  │   Bar    │ │  Panel   │ │  Panel   │ │   Panel    │ │
+│  │ Scrub    │ │ Apps     │ │Chat│Trans│ │ General    │ │
+│  │ Rewind   │ │ Meetings │ │ Quick   │ │ Screen     │ │
+│  │ Calendar │ │ Starred  │ │ Actions │ │ Audio      │ │
+│  └──────────┘ └──────────┘ └──────────┘ └────────────┘ │
+│                                                          │
+│  HTTP API (port 9457)         Tauri IPC (invoke)        │
+├──────────────────────────────────────────────────────────┤
+│                                                          │
+│  Backend (Rust)                                          │
+│                                                          │
+│  Recording Engine                                        │
+│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
+│  │ Screenshot│ │  HEVC    │ │   OCR    │ │  Frame    │ │
+│  │  (xcap)   │ │ Encoder  │ │ (Vision) │ │  Dedup    │ │
+│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
+│                                                          │
+│  Audio Engine                                            │
+│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
+│  │    Mic    │ │ Whisper  │ │ Speaker  │ │  Meeting  │ │
+│  │ Recorder  │ │ (local)  │ │   ID     │ │  Detect   │ │
+│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
+│                                                          │
+│  Knowledge Layer                                         │
+│  ┌───────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ │
+│  │  Vault    │ │  Daily   │ │ Working  │ │   Pipe    │ │
+│  │  Sync     │ │ Journal  │ │ Memory   │ │ Scheduler │ │
+│  └───────────┘ └──────────┘ └──────────┘ └───────────┘ │
+│                                                          │
+│  Storage: SQLite (FTS5) + JPEG + HEVC (.mp4)            │
+│  All data at ~/.mindscope/                               │
+├──────────────────────────────────────────────────────────┤
+│  Swift Helpers (compiled at ~/.mindscope/bin/)           │
+│  hevc_encoder · frame_reader · ocr_helper · active_app  │
+└──────────────────────────────────────────────────────────┘
+```
