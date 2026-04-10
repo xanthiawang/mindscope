@@ -4,7 +4,7 @@ import SearchPanel from "./components/SearchPanel";
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow } from "./lib/commands";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
@@ -757,26 +757,33 @@ function App() {
 
   // === Bar mode — white glass, original two-row layout ===
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "transparent", pointerEvents: anyPanelOpen ? "auto" : "none" }}
+    <div
+      style={{ width: "100vw", height: "100vh", background: "transparent" }}
       onClick={() => {
-        // Click on transparent area above bar → close all panels
         if (anyPanelOpen) {
           setShowBrief(false); setShowAI(false); setShowSettings(false);
           setShowSearch(false); setShowDatePicker(false);
         }
       }}
     >
-    <div onClick={(e) => e.stopPropagation()} style={{
-      position: "fixed", bottom: 0, left: 0, right: 0, height: 70,
-      background: "rgba(255, 255, 255, 0.78)",
-      backdropFilter: "blur(40px) saturate(200%)",
-      WebkitBackdropFilter: "blur(40px) saturate(200%)",
-      borderRadius: "16px 16px 0 0",
-      display: "flex", flexDirection: "column", justifyContent: "center",
-      padding: "6px 16px", overflow: "visible",
-      pointerEvents: "auto",
-      boxShadow: "0 -1px 8px rgba(0,0,0,0.04), inset 0 0.5px 0 rgba(255,255,255,0.6)",
-    }}>
+    <div
+      onClick={(e) => e.stopPropagation()}
+      onMouseEnter={() => { setClickthrough(false).catch(() => {}); }}
+      onMouseLeave={() => {
+        // Only re-enable clickthrough if no panel is open
+        if (!anyPanelOpen) setClickthrough(true).catch(() => {});
+      }}
+      style={{
+        position: "fixed", bottom: 0, left: 0, right: 0, height: 70,
+        background: "rgba(255, 255, 255, 0.78)",
+        backdropFilter: "blur(40px) saturate(200%)",
+        WebkitBackdropFilter: "blur(40px) saturate(200%)",
+        borderRadius: "16px 16px 0 0",
+        display: "flex", flexDirection: "column", justifyContent: "center",
+        padding: "6px 16px", overflow: "visible",
+        pointerEvents: "auto",
+        boxShadow: "0 -1px 8px rgba(0,0,0,0.04), inset 0 0.5px 0 rgba(255,255,255,0.6)",
+      }}>
       {/* Top row: search + time + controls */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
         {/* Search box */}
