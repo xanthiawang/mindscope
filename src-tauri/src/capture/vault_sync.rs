@@ -89,8 +89,11 @@ pub fn generate_daily_brief() -> String {
         brief.push_str("\n");
     }
 
-    // ─── Section 4: Focus + Tasks — only if _working-memory.md exists ───
+    // ─── Section 4: Focus — auto-inferred from recent activity ───
+    // 1. If _working-memory.md exists (agentic-cortex users), read it
+    // 2. Otherwise, use Claude CLI to infer Focus from recent screen activity
     let wm_path = ms_vault.join("_working-memory.md");
+    let mut focus_written = false;
     if wm_path.exists() {
         if let Ok(content) = fs::read_to_string(&wm_path) {
             let focus = extract_section(&content, "Current Focus").unwrap_or_default();
@@ -98,12 +101,20 @@ pub fn generate_daily_brief() -> String {
             if !focus.is_empty() {
                 let short: String = focus.lines().take(2).collect::<Vec<_>>().join("\n");
                 brief.push_str(&format!("## Focus\n{}\n\n", strip_md(&short)));
+                focus_written = true;
             }
             if !tasks.is_empty() {
                 let short: String = tasks.lines().filter(|l| l.starts_with("- ")).take(4)
                     .collect::<Vec<_>>().join("\n");
                 brief.push_str(&format!("## Tasks\n{}\n\n", strip_md(&short)));
             }
+        }
+    }
+
+    // Fallback: infer Focus from recent OCR + meeting transcripts via Claude
+    if !focus_written {
+        if let Some(inferred) = infer_focus_from_activity() {
+            brief.push_str(&format!("## Focus\n{}\n\n", strip_md(&inferred)));
         }
     }
 
@@ -233,6 +244,92 @@ fn today_stats() -> String {
     } else { 0 };
 
     format!("{} frames · {} apps · {}m active", total_frames, total_apps, span_min)
+}
+
+/// Infer the user's current focus from the last 2 hours of screen activity
+/// by asking Claude CLI to summarize recent OCR text + app usage.
+/// Cached to ~/.mindscope/data/focus_cache.json for 15 minutes to avoid
+/// hammering the CLI on every Brief open.
+fn infer_focus_from_activity() -> Option<String> {
+    use std::io::Write;
+
+    let cache_path = db::data_dir().join("focus_cache.txt");
+    let cache_ttl_secs: u64 = 15 * 60; // 15 min
+
+    // Check cache first
+    if let Ok(meta) = fs::metadata(&cache_path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(age) = modified.elapsed() {
+                if age.as_secs() < cache_ttl_secs {
+                    if let Ok(cached) = fs::read_to_string(&cache_path) {
+                        let trimmed = cached.trim();
+                        if !trimmed.is_empty() { return Some(trimmed.to_string()); }
+                    }
+                }
+            }
+        }
+    }
+
+    // Gather the last 2 hours of screen activity
+    let date = today_date();
+    let frames = db::get_frames_for_date(&date).unwrap_or_default();
+    if frames.is_empty() { return None; }
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    let cutoff = now_us - (2 * 3600 * 1_000_000);
+
+    let recent: Vec<_> = frames.iter().filter(|f| f.timestamp >= cutoff).collect();
+    if recent.len() < 3 { return None; }
+
+    // Build a compact summary: app transitions + sample OCR snippets
+    let mut sample_text = String::new();
+    let mut last_app = String::new();
+    let mut ocr_samples: Vec<&str> = Vec::new();
+    for f in &recent {
+        if f.app_name != last_app && !f.app_name.is_empty() {
+            sample_text.push_str(&format!("[{}] ", f.app_name));
+            last_app = f.app_name.clone();
+        }
+        // Sample OCR text — pick non-empty, reasonable length
+        if !f.ocr_text.is_empty() && f.ocr_text.len() > 20 {
+            ocr_samples.push(&f.ocr_text);
+        }
+    }
+
+    // Take first 5 OCR samples, truncated
+    let ocr_snippet: String = ocr_samples.iter().take(5)
+        .map(|t| {
+            // Strip the ---REGIONS--- block if present
+            let clean = t.split("---REGIONS---").next().unwrap_or(t);
+            clean.chars().take(200).collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let prompt = format!(
+        "Based on the following 2-hour screen activity, write a ONE-LINE Focus summary \
+         (max 80 chars) describing what the user is currently working on. No prefixes, \
+         no markdown, no quotes — just the sentence.\n\n\
+         App transitions: {}\n\n\
+         Recent screen text samples: {}\n\n\
+         Focus:",
+        sample_text.chars().take(500).collect::<String>(),
+        ocr_snippet.chars().take(1500).collect::<String>(),
+    );
+
+    let response = call_claude(&prompt)?;
+    let focus_line = response.lines().next().unwrap_or("").trim().to_string();
+    if focus_line.is_empty() || focus_line.len() > 200 { return None; }
+
+    // Cache it
+    if let Ok(mut f) = fs::File::create(&cache_path) {
+        let _ = f.write_all(focus_line.as_bytes());
+    }
+
+    Some(focus_line)
 }
 
 // ─── 2. Daily journal ────────────────────────────────────────────

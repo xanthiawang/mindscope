@@ -53,18 +53,45 @@ html, body {
 
 .timeline-scrubber {
   position: absolute;
-  top: -4px;
-  width: 3px;
-  height: 18px;
-  background: white;
-  border-radius: 1px;
-  box-shadow: 0 0 4px rgba(0,0,0,0.3), 0 0 1px rgba(0,0,0,0.5);
+  top: -6px;
+  width: 4px;
+  height: 22px;
+  background: #007aff;
+  border-radius: 2px;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.9),
+    0 0 8px rgba(0, 122, 255, 0.6),
+    0 2px 6px rgba(0, 0, 0, 0.25);
   z-index: 10;
   cursor: ew-resize;
   transition: transform 0.08s ease;
 }
+.timeline-scrubber::before {
+  content: "";
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #007aff;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.95), 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+.timeline-scrubber::after {
+  content: "";
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #007aff;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.95), 0 2px 6px rgba(0, 0, 0, 0.3);
+}
 .timeline-scrubber:hover {
-  transform: scaleX(2.5);
+  transform: scaleX(1.3);
 }
 
 /* ===== Time Label (Apple pill style) ===== */
