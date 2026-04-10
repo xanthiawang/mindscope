@@ -27,15 +27,25 @@ type ManagedState = Mutex<AppState>;
 
 #[tauri::command]
 fn check_permission() -> bool {
-    // First check the atomic flag (set by recorder on successful capture)
+    // If we already confirmed, return quickly
     if screenshot::check_screen_permission() {
         return true;
     }
-    // Fallback: check if DB has any frames (recorder already captured successfully)
+    // Check if DB has any frames (means we captured before = permission granted)
     if let Ok(stats) = db::get_storage_stats() {
         if stats.frame_count > 0 {
             screenshot::mark_permission_granted();
             return true;
+        }
+    }
+    // Check if frames directory has files
+    let data_dir = db::data_dir().join("frames");
+    if data_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            if entries.into_iter().count() > 0 {
+                screenshot::mark_permission_granted();
+                return true;
+            }
         }
     }
     false
@@ -235,10 +245,35 @@ fn stop_audio(state: State<'_, ManagedState>) {
     state.audio_recorder.stop();
 }
 
+/// Toggle audio recording on/off (for manual mic button)
+#[tauri::command]
+fn toggle_audio(state: State<'_, ManagedState>) -> bool {
+    let state = state.lock().unwrap();
+    if state.audio_recorder.is_running() {
+        state.audio_recorder.stop();
+        false
+    } else {
+        state.audio_recorder.start()
+    }
+}
+
+/// Check if audio is currently recording
 #[tauri::command]
 fn is_audio_recording(state: State<'_, ManagedState>) -> bool {
     let state = state.lock().unwrap();
     state.audio_recorder.is_running()
+}
+
+/// Get meeting state: { active, app_name, recording }
+#[tauri::command]
+fn get_meeting_state(state: State<'_, ManagedState>) -> serde_json::Value {
+    let (active, _app, _start) = capture::recorder::get_meeting_state();
+    let recording = state.lock().unwrap().audio_recorder.is_running();
+    serde_json::json!({
+        "active": active,
+        "app": _app,
+        "recording": recording
+    })
 }
 
 #[tauri::command]
@@ -320,9 +355,9 @@ fn get_ocr_regions(image_path: String) -> Vec<capture::ocr::OcrRegion> {
 async fn ask_ai(prompt: String) -> Result<String, String> {
     use std::process::Command;
 
-    // Use .mindscope/vault as working dir (Claude gets CLAUDE.md, skills, memory)
+    // Use agentic-cortex-vault as working dir (Claude gets CLAUDE.md, skills, memory)
     // Also pass MindScope vault path so Claude can reference meeting notes, people, projects
-    let ac_vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope/vault");
+    let ac_vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
     let ms_vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
     let cwd = if ac_vault.exists() { ac_vault } else { dirs_next::home_dir().unwrap_or_default() };
 
@@ -351,9 +386,10 @@ async fn ask_ai(prompt: String) -> Result<String, String> {
         prompt.clone()
     };
 
-    let result = Command::new("claude")
+    let result = Command::new("/opt/homebrew/bin/claude")
         .args(["-p", &enriched_prompt])
         .current_dir(&cwd)
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output();
 
     match result {
@@ -556,7 +592,7 @@ pub fn run() {
         .manage(Mutex::new(AppState {
             vault_path,
             recorder: Recorder::new(2),  // 2-second interval (was 5)
-            audio_recorder: AudioRecorder::new(30),
+            audio_recorder: AudioRecorder::new(8),
         }))
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -593,7 +629,11 @@ pub fn run() {
             {
                 let state: State<'_, ManagedState> = app.state();
                 let s = state.lock().unwrap();
-                s.recorder.start();
+                let started = s.recorder.start();
+                let _ = std::fs::write(
+                    db::data_dir().join("debug.log"),
+                    format!("Recorder start result: {}\n", started)
+                );
                 // s.audio_recorder.start(); // Disabled: triggers permission dialog
             }
 
@@ -666,6 +706,8 @@ pub fn run() {
             start_audio,
             stop_audio,
             is_audio_recording,
+            toggle_audio,
+            get_meeting_state,
             get_audio_segments,
             get_timeline,
             get_all_thumbnails,

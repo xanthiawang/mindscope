@@ -105,7 +105,7 @@ async fn get_app_icon(Path(app_name): Path<String>) -> Result<Response, StatusCo
     ).into_response())
 }
 
-/// GET /meeting/status — live meeting state + recent transcripts
+/// GET /meeting/status — live meeting state + recent transcripts (current session only)
 async fn meeting_status_handler() -> axum::Json<serde_json::Value> {
     let (active, app_name, start_time) = recorder::get_meeting_state();
 
@@ -113,16 +113,50 @@ async fn meeting_status_handler() -> axum::Json<serde_json::Value> {
     if active && start_time > 0 {
         let date = today();
         let segments = audio::load_audio_segments(&date);
-        // Filter segments and take last 10 with transcripts
+
+        // Parse segment timestamp to epoch micros and filter to current session
+        let parse_ts = |ts: &str| -> i64 {
+            // Format: "2026-04-09T22:50:15" — treat as local time
+            if ts.len() < 19 { return 0; }
+            let year: i64 = ts[0..4].parse().unwrap_or(0);
+            let month: i64 = ts[5..7].parse().unwrap_or(0);
+            let day: i64 = ts[8..10].parse().unwrap_or(0);
+            let hour: i64 = ts[11..13].parse().unwrap_or(0);
+            let min: i64 = ts[14..16].parse().unwrap_or(0);
+            let sec: i64 = ts[17..19].parse().unwrap_or(0);
+            let tz_offset: i64 = std::process::Command::new("date").args(["+%z"]).output().ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.len() >= 5 {
+                        let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
+                        let h: i64 = s[1..3].parse().unwrap_or(0);
+                        let m: i64 = s[3..5].parse().unwrap_or(0);
+                        Some(sign * (h * 3600 + m * 60))
+                    } else { None }
+                }).unwrap_or(0);
+            let mut days: i64 = 0;
+            for y in 1970..year {
+                days += if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+            }
+            let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            for m in 0..(month - 1) as usize {
+                days += if m == 1 && is_leap { 29 } else { month_days[m] };
+            }
+            days += day - 1;
+            ((days * 86400 + hour * 3600 + min * 60 + sec) - tz_offset) * 1_000_000
+        };
+
+        // Only include segments from current session (ts >= start_time)
         let mut matched: Vec<_> = segments.into_iter()
             .filter(|seg| !seg.transcript.is_empty())
+            .filter(|seg| parse_ts(&seg.timestamp) >= start_time - 5_000_000) // 5s margin
             .collect();
-        // Keep only last 10
-        if matched.len() > 10 {
-            matched = matched.split_off(matched.len() - 10);
+        if matched.len() > 30 {
+            matched = matched.split_off(matched.len() - 30);
         }
         for seg in matched {
-            // timestamp is like "2026-01-15T17:35:02" — extract HH:MM
+            let seg_ts = parse_ts(&seg.timestamp);
             let time_str = if seg.timestamp.len() >= 16 {
                 seg.timestamp[11..16].to_string()
             } else {
@@ -132,6 +166,7 @@ async fn meeting_status_handler() -> axum::Json<serde_json::Value> {
                 "time": time_str,
                 "speaker": "Speaker",
                 "text": seg.transcript,
+                "ts": seg_ts,
             }));
         }
     }
@@ -139,6 +174,7 @@ async fn meeting_status_handler() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "active": active,
         "app_name": app_name,
+        "start_ts": start_time,
         "start_time": start_time,
         "recent_transcripts": recent_transcripts,
     }))

@@ -19,66 +19,44 @@ pub fn check_mic_permission() -> bool {
         return true;
     }
 
-    // Method 1: Check macOS AVFoundation authorization status via osascript
-    let output = Command::new("osascript")
-        .args(["-e", r#"use framework "AVFoundation"
-set status to current application's AVCaptureDevice's authorizationStatusForMediaType:(current application's AVMediaTypeAudio)
-if status = 3 then
-    return "authorized"
-else
-    return "denied"
-end if"#])
-        .output()
-        .ok();
-
-    if let Some(out) = output {
-        let result = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-        if result.contains("authorized") {
-            MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
-            MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
-            return true;
-        }
-    }
-
-    // Method 2: Fallback — if we've successfully recorded before, we have permission
-    let audio_dir = db::data_dir().join("audio");
-    if audio_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&audio_dir) {
-            for entry in entries.flatten() {
-                // Check subdirs for actual audio files, not just empty dirs
-                if entry.path().is_dir() {
-                    if let Ok(files) = fs::read_dir(entry.path()) {
-                        if files.into_iter().any(|f| f.ok().map_or(false, |f| {
-                            f.path().extension().map_or(false, |ext| ext == "m4a" || ext == "wav")
-                        })) {
-                            MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // Always return true — let ffmpeg handle the actual permission check.
+    // When ffmpeg tries to access the mic via AVFoundation, macOS will show
+    // the permission dialog if needed. If denied, ffmpeg just fails silently.
+    MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
     MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
-    false
+    true
 }
 
 /// Request microphone permission — triggers dialog ONCE
 /// Only call this from an explicit user action (button click)
 pub fn request_mic_permission() -> bool {
     // Use a tiny recording attempt to trigger the permission dialog
-    let tmp = std::env::temp_dir().join("mindscope_mic_test.wav");
-    let tmp_str = tmp.to_str().unwrap_or("/tmp/mindscope_mic_test.wav");
+    let tmp = std::env::temp_dir().join("mindscope_mic_test.m4a");
+    let tmp_str = tmp.to_str().unwrap_or("/tmp/mindscope_mic_test.m4a");
 
-    // afrecord for 0.1 seconds — triggers microphone permission dialog
-    let status = Command::new("afrecord")
-        .args(["-d", "aac", "-f", "m4af", "-c", "1", "-r", "16000", "-s", "0.1", tmp_str])
-        .status();
+    // Try ffmpeg first
+    let ffmpeg_paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];
+    let mut granted = false;
+    for ffmpeg in &ffmpeg_paths {
+        if Command::new(ffmpeg).arg("-version").output().is_ok() {
+            let status = Command::new(ffmpeg)
+                .args(["-f", "avfoundation", "-i", ":default", "-t", "0.5", "-y", tmp_str])
+                .stderr(std::process::Stdio::null())
+                .status();
+            granted = status.map(|s| s.success()).unwrap_or(false);
+            break;
+        }
+    }
+
+    if !granted {
+        // Fallback: afrecord
+        let status = Command::new("afrecord")
+            .args(["-d", "aac", "-f", "m4af", "-c", "1", "-r", "16000", "-s", "0.5", tmp_str])
+            .status();
+        granted = status.map(|s| s.success()).unwrap_or(false);
+    }
 
     let _ = fs::remove_file(&tmp);
-
-    let granted = status.map(|s| s.success()).unwrap_or(false);
     MIC_PERMISSION_GRANTED.store(granted, Ordering::Relaxed);
     MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
     granted
@@ -162,6 +140,7 @@ impl AudioRecorder {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         let _ = Command::new("pkill").args(["-f", "afrecord"]).status();
+        let _ = Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
     }
 
     pub fn is_running(&self) -> bool {
@@ -176,6 +155,29 @@ impl AudioRecorder {
 
 fn record_chunk(output_path: &Path, duration_secs: u64) -> bool {
     let path_str = output_path.to_str().unwrap_or("");
+
+    // Try ffmpeg first (most reliable, widely available via homebrew)
+    let ffmpeg_paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];
+    for ffmpeg in &ffmpeg_paths {
+        if Command::new(ffmpeg).arg("-version").output().is_ok() {
+            let status = Command::new(ffmpeg)
+                .args([
+                    "-f", "avfoundation",
+                    "-i", ":default",          // default audio input device
+                    "-t", &duration_secs.to_string(),
+                    "-ac", "1",                // mono
+                    "-ar", "16000",            // 16kHz for Whisper
+                    "-c:a", "aac",
+                    "-y",                      // overwrite
+                    path_str,
+                ])
+                .stderr(std::process::Stdio::null())
+                .status();
+            return status.map(|s| s.success()).unwrap_or(false);
+        }
+    }
+
+    // Fallback: afrecord (older macOS)
     let status = Command::new("afrecord")
         .args(["-d", "aac", "-f", "m4af", "-c", "1", "-r", "16000", "-s", &duration_secs.to_string(), path_str])
         .status();

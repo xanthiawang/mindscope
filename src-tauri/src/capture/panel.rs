@@ -44,6 +44,25 @@ mod macos {
         }
     }
 
+    /// Make this window invisible to screen capture (exclude from screenshots/recordings).
+    /// Uses NSWindowSharingType::NSWindowSharingNone (value = 0).
+    /// This is how Screenpipe/Zoom/etc. hide their own UI from screen captures.
+    pub fn set_excluded_from_capture(ns_window: id) {
+        unsafe {
+            // NSWindowSharingNone = 0
+            let _: () = msg_send![ns_window, setSharingType: 0u64];
+            // Verify
+            let current: u64 = msg_send![ns_window, sharingType];
+            let log = format!("setSharingType called, now = {}\n", current);
+            use std::io::Write;
+            let log_path = dirs_next::home_dir().unwrap_or_default()
+                .join(".mindscope").join("data").join("panel_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = f.write_all(log.as_bytes());
+            }
+        }
+    }
+
     pub fn get_ns_window(window: &tauri::WebviewWindow) -> Option<id> {
         #[allow(deprecated)]
         window.ns_window().ok().map(|ptr| ptr as id)
@@ -58,6 +77,7 @@ pub fn configure_bar_mode(window: &tauri::WebviewWindow) {
             macos::set_window_level(ns_window, macos::NS_FLOATING_WINDOW_LEVEL);
             macos::set_ignore_mouse_events(ns_window, false);
             macos::set_overlay_collection_behavior(ns_window);
+            macos::set_excluded_from_capture(ns_window);
         }
     }
 }
@@ -69,6 +89,7 @@ pub fn configure_fullscreen_mode(window: &tauri::WebviewWindow) {
         if let Some(ns_window) = macos::get_ns_window(window) {
             macos::set_window_level(ns_window, macos::NS_SCREEN_SAVER_WINDOW_LEVEL);
             macos::set_ignore_mouse_events(ns_window, false);
+            macos::set_excluded_from_capture(ns_window);
         }
     }
 }

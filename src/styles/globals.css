@@ -210,6 +210,11 @@ html, body {
   100% { transform: translateX(-100%); }
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.8); }
+}
+
 /* ===== Input focus ring (Apple style) ===== */
 input:focus {
   outline: none;

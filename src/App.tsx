@@ -5,6 +5,7 @@ import SearchPanel from "./components/SearchPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
 import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, expandBar, collapseBar } from "./lib/commands";
+import { invoke } from "@tauri-apps/api/core";
 import { getAppColor, getAppShort } from "./lib/appColors";
 import "./styles/globals.css";
 
@@ -83,6 +84,8 @@ function App() {
   const [pickerMonth, setPickerMonth] = useState(() => new Date());
   const [aiTab, setAiTab] = useState<"chat" | "transcript">("chat");
   const [meetingActive, setMeetingActive] = useState(false);
+  const [, setMeetingSessionStart] = useState<number>(0);
+  const [micManualOn, setMicManualOn] = useState(false);
   const [meetingTranscripts, setMeetingTranscripts] = useState<Array<{time: string, speaker: string, text: string}>>([]);
   const [latestTranscript, setLatestTranscript] = useState("");
   const meetingScrollRef = useRef<HTMLDivElement>(null);
@@ -275,14 +278,32 @@ function App() {
     }
   }, [date]);
 
-  // Poll meeting status every 5s (always active)
+  // Poll meeting status every 2s for responsive transcript updates
   useEffect(() => {
     const poll = async () => {
       try {
         const resp = await fetch("http://127.0.0.1:9457/meeting/status");
         const data = await resp.json();
-        setMeetingActive(!!data.active);
-        const transcripts = data.recent_transcripts || [];
+        const isActive = !!data.active;
+        const sessionStart = data.start_ts || 0;
+
+        setMeetingActive(isActive);
+
+        // Session-based transcript management
+        // If a new session started (different start_ts), clear old transcripts
+        setMeetingSessionStart((prev) => {
+          if (sessionStart !== prev && sessionStart > 0) {
+            // New session — clear previous
+            setMeetingTranscripts([]);
+            setLatestTranscript("");
+          }
+          return sessionStart;
+        });
+
+        // Only show transcripts from the current session
+        const transcripts = (data.recent_transcripts || []).filter(
+          (t: { ts?: number }) => !sessionStart || !t.ts || t.ts >= sessionStart
+        );
         setMeetingTranscripts(transcripts);
         if (transcripts.length > 0) {
           const last = transcripts[transcripts.length - 1];
@@ -293,7 +314,7 @@ function App() {
       }
     };
     poll();
-    const t = setInterval(poll, 5000);
+    const t = setInterval(poll, 2000);
     return () => clearInterval(t);
   }, []);
 
@@ -647,6 +668,34 @@ function App() {
         {/* Frame count */}
         <span style={{ fontSize: 11, color: "#8e8e93" }}>{frames.length} frames</span>
 
+        {/* Mic toggle — prominent position next to frame count */}
+        <button onClick={async () => {
+          const nowRecording = await invoke("toggle_audio");
+          setMicManualOn(nowRecording as boolean);
+        }} style={{
+          background: (micManualOn || meetingActive) ? "rgba(255,59,48,0.15)" : "rgba(0,0,0,0.04)",
+          border: (micManualOn || meetingActive) ? "1px solid rgba(255,59,48,0.3)" : "none",
+          borderRadius: 100, width: 28, height: 28,
+          cursor: "pointer",
+          color: (micManualOn || meetingActive) ? "#ff3b30" : "#86868b",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexShrink: 0,
+          position: "relative",
+        }} title={(micManualOn || meetingActive) ? "Recording — click to stop" : "Start recording"}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+          {(micManualOn || meetingActive) && (
+            <span style={{
+              position: "absolute", top: 2, right: 2,
+              width: 6, height: 6, borderRadius: 3,
+              background: "#ff3b30",
+              animation: "pulse 1.5s ease-in-out infinite",
+            }} />
+          )}
+        </button>
+
         {/* Brief */}
         <button onClick={() => setShowBrief(!showBrief)} style={{
           background: showBrief ? "rgba(0,0,0,0.1)" : "rgba(0,0,0,0.04)", border: "none", borderRadius: 100, width: 26, height: 26,
@@ -657,14 +706,14 @@ function App() {
         <div style={{
           display: "flex", alignItems: "center", gap: 5,
           background: "rgba(0,0,0,0.04)", borderRadius: 100,
-          padding: "4px 10px", width: 180,
+          padding: "4px 10px", minWidth: 80, flex: 1, maxWidth: 160,
         }}>
           <span style={{ color: "#aeaeb2", flexShrink: 0 }}><SparkleIcon /></span>
           <input type="text" value={aiInput} onChange={(e) => setAiInput(e.target.value)}
             onFocus={() => setShowAI(true)}
             onKeyDown={(e) => { if (e.key === "Enter" && aiInput.trim()) handleMeetingAwareAiQuery(aiInput.trim()); }}
             placeholder="Ask"
-            style={{ flex: 1, background: "transparent", border: "none", outline: "none", fontSize: 11, color: "#1d1d1f" }}
+            style={{ flex: 1, background: "transparent", border: "none", outline: "none", fontSize: 11, color: "#1d1d1f", minWidth: 30 }}
           />
         </div>
 

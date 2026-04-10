@@ -14,7 +14,7 @@ fn models_dir() -> PathBuf {
 }
 
 fn default_model_path() -> PathBuf {
-    models_dir().join("ggml-base.en.bin")
+    models_dir().join("ggml-base.bin")
 }
 
 /// Check if Whisper model is downloaded
@@ -29,7 +29,7 @@ pub fn download_model() -> Result<(), String> {
 
     let _ = std::fs::create_dir_all(models_dir());
     log::info!("MindScope: Downloading Whisper model via curl...");
-    let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+    let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
 
     let status = std::process::Command::new("curl")
         .args(["-L", "-o", model_path.to_str().unwrap_or(""), url])
@@ -91,20 +91,22 @@ pub fn transcribe(audio_path: &Path) -> Result<String, String> {
 
     let mut state = ctx.create_state().map_err(|e| format!("State error: {:?}", e))?;
 
-    // Whisper parameters — tuned from Screenpipe's production config
+    // Whisper parameters — tuned for multilingual (Chinese + English)
     let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(2);
-    params.set_language(Some("en"));
+    params.set_language(None); // Auto-detect language (Chinese, English, etc.)
+    params.set_translate(false); // Keep original language, don't translate to English
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_suppress_blank(true);
     params.set_suppress_nst(true);
-    // Anti-hallucination parameters
-    params.set_entropy_thold(2.4);
-    params.set_logprob_thold(-2.0);
-    params.set_no_speech_thold(0.6);
+    // Anti-hallucination parameters (stricter to avoid repetition loops)
+    params.set_entropy_thold(2.2);
+    params.set_logprob_thold(-1.5);
+    params.set_no_speech_thold(0.5);
+    params.set_max_tokens(128); // Limit tokens per segment to prevent runaway repetition
 
     state.full(params, &samples).map_err(|e| format!("Transcribe error: {:?}", e))?;
 
@@ -124,7 +126,9 @@ pub fn transcribe(audio_path: &Path) -> Result<String, String> {
         let _ = std::fs::remove_file(&wav_path);
     }
 
-    Ok(text.trim().to_string())
+    // Post-process: remove hallucinated repetitions
+    let text = deduplicate_text(text.trim());
+    Ok(text)
 }
 
 /// Convert m4a to WAV 16kHz mono using afconvert (macOS)
@@ -180,4 +184,51 @@ fn load_wav_samples(wav_path: &Path) -> Result<Vec<f32>, String> {
     } else {
         Ok(samples)
     }
+}
+
+/// Remove hallucinated repetitions from Whisper output.
+/// Supports both English (split by .) and Chinese (split by 。，)
+fn deduplicate_text(text: &str) -> String {
+    // Split by sentence boundaries (English + Chinese punctuation)
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        current.push(c);
+        if matches!(c, '.' | '。' | '！' | '？') || (c == ' ' && current.trim().len() > 15) {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() && trimmed != "." && trimmed != "。" {
+                sentences.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() { sentences.push(trimmed); }
+
+    if sentences.len() < 3 { return text.to_string(); }
+
+    // Detect repeated phrases
+    let mut result: Vec<String> = Vec::new();
+    let mut prev = String::new();
+    let mut repeat_count = 0;
+
+    for s in &sentences {
+        if *s == prev {
+            repeat_count += 1;
+            if repeat_count >= 2 { continue; }
+        } else {
+            repeat_count = 0;
+        }
+        prev = s.clone();
+        result.push(s.clone());
+    }
+
+    if result.is_empty() { return String::new(); }
+
+    // If over 60% were repeats, it's hallucination
+    if result.len() * 3 < sentences.len() {
+        return String::new();
+    }
+
+    result.join(" ")
 }

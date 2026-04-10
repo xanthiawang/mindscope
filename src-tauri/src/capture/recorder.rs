@@ -55,9 +55,10 @@ impl Recorder {
             let mut meeting_start_ts: i64 = 0;
             let mut meeting_app_name = String::new();
             let meeting_apps = ["zoom.us", "Zoom", "FaceTime", "Microsoft Teams",
-                "Webex", "Discord", "Tencent Meeting", "TencentMeeting", "腾讯会议",
+                "Webex", "Discord", "Tencent Meeting", "TencentMeeting",
+                "腾讯会议TencentMeeting", "腾讯会议",
                 "DingTalk", "钉钉", "飞书", "Lark", "Skype", "WeMeet"];
-            let auto_audio = audio::AudioRecorder::new(30);
+            let auto_audio = audio::AudioRecorder::new(8);
 
             log::info!("MindScope recorder started, interval={}s", interval);
 
@@ -66,10 +67,23 @@ impl Recorder {
                 return;
             }
 
+            // Bootstrap permission: if DB has frames, we already have permission
+            if let Ok(stats) = db::get_storage_stats() {
+                if stats.frame_count > 0 {
+                    mark_permission_granted();
+                }
+            }
+
             while running.load(Ordering::Relaxed) {
                 if !check_screen_permission() {
-                    thread::sleep(Duration::from_secs(5));
-                    continue;
+                    // Try a test capture to bootstrap permission
+                    let test_dir = db::frames_dir(&chrono_now()[..10]);
+                    if capture_screen(&test_dir).is_some() {
+                        // capture_screen sets PERMISSION_CONFIRMED on success
+                    } else {
+                        thread::sleep(Duration::from_secs(5));
+                        continue;
+                    }
                 }
 
                 // Start HEVC encoder on first successful permission check
@@ -86,27 +100,46 @@ impl Recorder {
                 let (app_name, window_name, _bundle_id, _browser_url) = get_active_window_info();
                 let same_context = app_name == last_app && frame_count > 0;
 
-                // Meeting auto-detect: scan windows every 15 frames (~30s) to avoid lag
-                // But always check frontmost app name (fast, no AppleScript)
-                let in_meeting = if meeting_audio_active {
-                    // Already in meeting — quick check: is the meeting app still in frontmost or window list?
-                    // Only do full scan every 15 frames to confirm meeting ended
-                    let quick = meeting_apps.iter().any(|&m| {
-                        app_name.eq_ignore_ascii_case(m) || window_name.to_lowercase().contains(&m.to_lowercase())
-                    }) || window_name.to_lowercase().contains("meeting")
-                       || window_name.to_lowercase().contains("会议");
-                    if quick { true } else if frame_count % 15 == 0 { is_meeting_running(&meeting_apps) } else { true }
-                } else {
-                    // Not in meeting — check frontmost app first (fast), then full scan every 15 frames
-                    let quick = meeting_apps.iter().any(|&m| {
-                        app_name.eq_ignore_ascii_case(m)
-                    }) || window_name.to_lowercase().contains("meeting")
-                       || window_name.to_lowercase().contains("会议");
-                    if quick { true } else if frame_count % 15 == 0 { is_meeting_running(&meeting_apps) } else { false }
+                // Meeting auto-detect: use Swift helper + frontmost app name
+                let log_path = db::data_dir().join("debug.log");
+                let _ = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&log_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "frame={} app={} win={}", frame_count, app_name, window_name)
+                    });
+
+                let helper_result = if frame_count % 3 == 0 {
+                    is_meeting_process_running()
+                } else { false };
+
+                let app_match = {
+                    let app_lower = app_name.to_lowercase();
+                    meeting_apps.iter().any(|&m| {
+                        let ml = m.to_lowercase();
+                        app_lower.contains(&ml) || ml.contains(&app_lower)
+                    }) || window_name.to_lowercase().contains("会议")
                 };
 
+                let in_meeting = helper_result || meeting_audio_active || app_match;
+
+                let _ = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&log_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "  helper={} app_match={} in_meeting={}", helper_result, app_match, in_meeting)
+                    });
+
                 if in_meeting && !meeting_audio_active {
-                    if audio::check_mic_permission() {
+                    let has_mic = audio::check_mic_permission();
+                    let log_path = db::data_dir().join("debug.log");
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true).append(true).open(&log_path)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, ">>> MEETING START! mic={} app={}", has_mic, app_name)
+                        });
+                    if has_mic {
                         auto_audio.start();
                         meeting_audio_active = true;
                         meeting_start_ts = std::time::SystemTime::now()
@@ -238,6 +271,33 @@ impl Recorder {
 }
 
 pub fn timestamp_now() -> String { chrono_now() }
+
+/// Smart meeting detection using compiled Swift helper.
+/// Checks both meeting app running AND microphone actively in use.
+/// Returns: "MEETING|name|bundle" if in call, "APP_OPEN|..." if app open but not calling,
+///          "MIC_ACTIVE" if mic in use by unknown app, "NONE" if idle.
+fn is_meeting_active() -> (bool, String) {
+    let helper = dirs_next::home_dir().unwrap_or_default()
+        .join(".mindscope").join("bin").join("is_meeting");
+    if !helper.exists() { return (false, String::new()); }
+
+    if let Ok(output) = std::process::Command::new(helper.to_str().unwrap_or(""))
+        .output()
+    {
+        let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if result.starts_with("MEETING|") {
+            let parts: Vec<&str> = result.splitn(3, '|').collect();
+            let app_name = parts.get(1).unwrap_or(&"Meeting").to_string();
+            return (true, app_name);
+        }
+    }
+    (false, String::new())
+}
+
+// Keep backwards compat
+fn is_meeting_process_running() -> bool {
+    is_meeting_active().0
+}
 
 /// Check if a meeting is actively in progress
 /// Uses window title scanning — Zoom shows "Zoom Meeting" window only during calls

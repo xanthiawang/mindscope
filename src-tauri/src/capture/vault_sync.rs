@@ -21,14 +21,14 @@ use super::recorder;
 // Guard: only one sync loop thread at a time
 static SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Find the vault directory — tries ~/.mindscope/vault/ first, then ~/.mindscope/vault/
+/// Find the vault directory — tries ~/.mindscope/vault/ first, then ~/agentic-cortex-vault/
 fn vault_dir() -> Option<PathBuf> {
     let home = dirs_next::home_dir()?;
     let ms = home.join(".mindscope").join("vault");
     if ms.exists() {
         return Some(ms);
     }
-    let ac = home.join(".mindscope/vault");
+    let ac = home.join("agentic-cortex-vault");
     if ac.exists() {
         return Some(ac);
     }
@@ -49,16 +49,47 @@ fn current_hour() -> u64 {
 
 // ─── 1. Daily brief ──────────────────────────────────────────────
 
-/// Read recent screen activity and vault data, return a brief string.
+/// Read recent screen activity and vault data, return a structured brief.
+/// Sections: Today (app time), Now (current activity), Meetings, Focus/Tasks (if vault exists)
 pub fn generate_daily_brief() -> String {
     let strip_md = |s: &str| -> String {
         s.replace("**", "").replace("[[", "").replace("]]", "").replace("|", " - ")
     };
 
     let mut brief = String::new();
-
-    // Read _working-memory.md ONLY from ~/.mindscope/vault ()
     let ms_vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
+
+    // ─── Section 1: Now — currently active app and latest context ───
+    let (current_app, current_window, _, _) = super::screenshot::get_active_window_info();
+    if !current_app.is_empty() && current_app != "Unknown" {
+        brief.push_str(&format!("## Now\n{}", current_app));
+        if !current_window.is_empty() && current_window != current_app {
+            brief.push_str(&format!(" — {}", current_window));
+        }
+        brief.push_str("\n\n");
+    }
+
+    // ─── Section 2: Today — app time breakdown (top 5 apps) ───
+    let today_apps = app_time_breakdown(24);
+    if !today_apps.is_empty() {
+        brief.push_str("## Today\n");
+        for (app, minutes) in today_apps.iter().take(5) {
+            brief.push_str(&format!("• {} — {}m\n", app, minutes));
+        }
+        brief.push_str("\n");
+    }
+
+    // ─── Section 3: Meetings — recent meetings from vault (last 3) ───
+    let recent_meetings = list_recent_meetings(&ms_vault, 3);
+    if !recent_meetings.is_empty() {
+        brief.push_str("## Recent Meetings\n");
+        for m in recent_meetings {
+            brief.push_str(&format!("• {}\n", strip_md(&m)));
+        }
+        brief.push_str("\n");
+    }
+
+    // ─── Section 4: Focus + Tasks — only if _working-memory.md exists ───
     let wm_path = ms_vault.join("_working-memory.md");
     if wm_path.exists() {
         if let Ok(content) = fs::read_to_string(&wm_path) {
@@ -66,36 +97,104 @@ pub fn generate_daily_brief() -> String {
             let tasks = extract_section(&content, "Live Tasks").unwrap_or_default();
             if !focus.is_empty() {
                 let short: String = focus.lines().take(2).collect::<Vec<_>>().join("\n");
-                brief.push_str(&format!("Focus\n{}\n\n", strip_md(&short)));
+                brief.push_str(&format!("## Focus\n{}\n\n", strip_md(&short)));
             }
             if !tasks.is_empty() {
                 let short: String = tasks.lines().filter(|l| l.starts_with("- ")).take(4)
                     .collect::<Vec<_>>().join("\n");
-                brief.push_str(&format!("Tasks\n{}\n\n", strip_md(&short)));
+                brief.push_str(&format!("## Tasks\n{}\n\n", strip_md(&short)));
             }
         }
     }
 
-    // Recent meeting notes from today
-    let today = today_date();
-    let meet_pattern = ms_vault.join(format!("meet.{}.md", today.replace('-', ".")));
-    if meet_pattern.exists() {
-        if let Ok(content) = fs::read_to_string(&meet_pattern) {
-            let title = content.lines().find(|l| l.starts_with("title:"))
-                .map(|l| l[6..].trim().to_string())
-                .unwrap_or("Meeting".into());
-            brief.push_str(&format!("Meeting today\n{}\n\n", strip_md(&title)));
-        }
+    // ─── Section 5: Stats — total capture stats for today ───
+    let stats = today_stats();
+    if !stats.is_empty() {
+        brief.push_str(&format!("## Stats\n{}\n", stats));
     }
-    // Always show recent activity from screen data
-    let recent = recent_app_summary(2);
-    if !recent.is_empty() {
-        brief.push_str(&format!("Recent\n{}", recent));
-    }
+
     if brief.is_empty() {
-        brief = "No activity recorded yet.".to_string();
+        brief = "No activity recorded yet. Start using your Mac and check back in a few minutes.".to_string();
     }
     brief
+}
+
+/// Get app time breakdown for the last N hours.
+/// Returns Vec<(app_name, minutes)> sorted by time desc.
+fn app_time_breakdown(hours: u64) -> Vec<(String, u64)> {
+    let date = today_date();
+    let frames = db::get_frames_for_date(&date).unwrap_or_default();
+    if frames.is_empty() { return Vec::new(); }
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    let cutoff = now_us - (hours as i64 * 3600 * 1_000_000);
+
+    let mut app_counts: HashMap<String, u64> = HashMap::new();
+    for f in frames.iter().filter(|f| f.timestamp >= cutoff) {
+        if f.app_name.is_empty() || f.app_name == "Unknown" { continue; }
+        *app_counts.entry(f.app_name.clone()).or_insert(0) += 1;
+    }
+
+    // Each frame = capture_interval seconds (default 3s)
+    let mut sorted: Vec<(String, u64)> = app_counts.into_iter()
+        .map(|(app, count)| (app, (count * 3) / 60)) // convert to minutes
+        .filter(|(_, m)| *m >= 1) // skip sub-minute entries
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted
+}
+
+/// List recent meeting titles from vault (last N meetings, any day).
+fn list_recent_meetings(vault: &Path, limit: usize) -> Vec<String> {
+    if !vault.exists() { return Vec::new(); }
+    let mut meetings: Vec<(String, String)> = Vec::new(); // (filename, title)
+
+    if let Ok(entries) = fs::read_dir(vault) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("meet.") || !name.ends_with(".md") { continue; }
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                let title = content.lines().find(|l| l.starts_with("title:"))
+                    .map(|l| l[6..].trim().to_string())
+                    .unwrap_or_default();
+                let display_title = if title.is_empty() {
+                    // Fallback to filename date
+                    name.trim_start_matches("meet.").trim_end_matches(".md").to_string()
+                } else {
+                    title
+                };
+                meetings.push((name, display_title));
+            }
+        }
+    }
+
+    // Sort by filename desc (newest first)
+    meetings.sort_by(|a, b| b.0.cmp(&a.0));
+    meetings.into_iter().take(limit).map(|(_, t)| t).collect()
+}
+
+/// Today's capture stats: frames captured, active apps, time span.
+fn today_stats() -> String {
+    let date = today_date();
+    let frames = db::get_frames_for_date(&date).unwrap_or_default();
+    if frames.is_empty() { return String::new(); }
+
+    let app_set: std::collections::HashSet<&str> = frames.iter()
+        .filter(|f| !f.app_name.is_empty() && f.app_name != "Unknown")
+        .map(|f| f.app_name.as_str())
+        .collect();
+
+    let total_frames = frames.len();
+    let total_apps = app_set.len();
+    // Active span = first to last frame, in minutes
+    let span_min = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+        (last.timestamp - first.timestamp) / 1_000_000 / 60
+    } else { 0 };
+
+    format!("{} frames · {} apps · {}m active", total_frames, total_apps, span_min)
 }
 
 // ─── 2. Daily journal ────────────────────────────────────────────
@@ -461,15 +560,16 @@ fn recent_app_summary(hours: u64) -> String {
 
 /// Call Claude CLI with a prompt.
 fn call_claude(prompt: &str) -> Option<String> {
-    let vault = dirs_next::home_dir()?.join(".mindscope/vault");
+    let vault = dirs_next::home_dir()?.join("agentic-cortex-vault");
     let cwd = if vault.exists() {
         vault
     } else {
         dirs_next::home_dir()?
     };
-    let output = std::process::Command::new("claude")
+    let output = std::process::Command::new("/opt/homebrew/bin/claude")
         .args(["-p", prompt])
         .current_dir(&cwd)
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
         .ok()?;
     if output.status.success() {

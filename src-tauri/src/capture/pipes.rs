@@ -236,12 +236,13 @@ fn gather_context(query: &Option<String>, hours: u32) -> String {
 
 /// Call Claude CLI
 fn call_claude(prompt: &str) -> Result<String, String> {
-    let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope/vault");
+    let vault = dirs_next::home_dir().unwrap_or_default().join("agentic-cortex-vault");
     let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
 
-    let result = std::process::Command::new("claude")
+    let result = std::process::Command::new("/opt/homebrew/bin/claude")
         .args(["-p", prompt])
         .current_dir(&cwd)
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output();
 
     match result {

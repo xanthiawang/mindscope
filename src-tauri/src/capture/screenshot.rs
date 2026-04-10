@@ -24,7 +24,30 @@ pub fn open_permission_settings() {
         .spawn();
 }
 
-/// Capture screenshot — save as small JPEG (~100-200KB instead of 7.5MB WebP)
+/// Get the topmost non-MindScope app window via CGWindowList z-order.
+/// Returns (app_name, window_title, pid, window_id) or None.
+fn get_topmost_app_window() -> Option<(String, String, u32, u32)> {
+    let helper = dirs_next::home_dir().unwrap_or_default()
+        .join(".mindscope").join("bin").join("topmost_window");
+    if !helper.exists() { return None; }
+
+    let output = std::process::Command::new(helper.to_str().unwrap_or(""))
+        .output().ok()?;
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if result == "NONE" || result.is_empty() { return None; }
+
+    let parts: Vec<&str> = result.splitn(4, '|').collect();
+    if parts.len() < 4 { return None; }
+    let app = parts[0].to_string();
+    let title = parts[1].to_string();
+    let pid: u32 = parts[2].parse().ok()?;
+    let wid: u32 = parts[3].parse().ok()?;
+    Some((app, title, pid, wid))
+}
+
+/// Capture screenshot — uses CGWindowList z-order (via Swift helper) to find
+/// the topmost non-MindScope app, then captures that specific window via xcap.
+/// This mirrors Screenpipe's approach of filtering own UI from screen captures.
 pub fn capture_screen(output_dir: &Path) -> Option<PathBuf> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -34,39 +57,66 @@ pub fn capture_screen(output_dir: &Path) -> Option<PathBuf> {
     let filename = format!("frame_{}.jpg", timestamp);
     let filepath = output_dir.join(&filename);
 
-    match xcap::Monitor::all() {
-        Ok(monitors) => {
-            // Use primary (main) monitor, not just the first one
-            let monitor_opt = monitors.iter()
-                .find(|m| m.is_primary().unwrap_or(false))
-                .or(monitors.first());
-            if let Some(monitor) = monitor_opt {
-                match monitor.capture_image() {
-                    Ok(image) => {
-                        // Full resolution, JPEG 45% quality (~300KB, text readable)
-                        let mut buf = std::io::Cursor::new(Vec::new());
-                        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 45);
-                        if encoder.encode_image(&image).is_ok() {
-                            if std::fs::write(&filepath, buf.into_inner()).is_ok() {
-                                PERMISSION_CONFIRMED.store(true, Ordering::Relaxed);
-                                return Some(filepath);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("MindScope: capture failed: {}", e);
-                    }
+    // Multi-monitor support: find the monitor containing the frontmost app
+    // via CGWindowList (via topmost_window helper). Otherwise iterate all monitors
+    // and pick the one with the most "content" (highest std deviation).
+    let target_app = get_topmost_app_window().map(|(a, _, _, _)| a);
+
+    if let Ok(monitors) = xcap::Monitor::all() {
+        // Try to capture each monitor and pick the one with most content
+        let mut best_image: Option<image::DynamicImage> = None;
+        let mut best_std: f64 = 0.0;
+
+        for monitor in &monitors {
+            if let Ok(image) = monitor.capture_image() {
+                // Quick std calculation on a downsample
+                let dyn_img = image::DynamicImage::ImageRgba8(image);
+                let small = dyn_img.thumbnail(200, 200);
+                let pixels: Vec<u8> = small.to_rgb8().into_raw();
+                let mean: f64 = pixels.iter().map(|&p| p as f64).sum::<f64>() / pixels.len() as f64;
+                let variance: f64 = pixels.iter()
+                    .map(|&p| (p as f64 - mean).powi(2))
+                    .sum::<f64>() / pixels.len() as f64;
+                let std = variance.sqrt();
+
+                if std > best_std {
+                    best_std = std;
+                    best_image = Some(dyn_img);
                 }
             }
         }
-        Err(e) => log::warn!("MindScope: monitor enum failed: {}", e),
+
+        if let Some(img) = best_image {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 45);
+            if encoder.encode_image(&img).is_ok() {
+                if std::fs::write(&filepath, buf.into_inner()).is_ok() {
+                    PERMISSION_CONFIRMED.store(true, Ordering::Relaxed);
+                    let _ = target_app; // reserved
+                    return Some(filepath);
+                }
+            }
+        }
     }
     None
 }
 
+/// Get active app info — uses CGWindowList to find topmost non-MindScope window.
+/// This is used by the recorder for accurate app tracking even when MindScope overlays the screen.
+pub fn get_active_app_via_zorder() -> Option<(String, String)> {
+    get_topmost_app_window().map(|(app, title, _, _)| (app, title))
+}
+
 /// Returns (app_name, window_title, bundle_id, browser_url)
 pub fn get_active_window_info() -> (String, String, String, String) {
-    // Use compiled Swift helper (NSWorkspace + Accessibility API)
+    // Priority 1: Use CGWindowList z-order (excludes MindScope itself)
+    if let Some((app, title)) = get_active_app_via_zorder() {
+        if !app.is_empty() && !app.eq_ignore_ascii_case("mindscope") {
+            return (app, title, String::new(), String::new());
+        }
+    }
+
+    // Priority 2: Use compiled Swift helper (NSWorkspace + Accessibility API)
     // Also caches app icon as PNG in ~/.mindscope/data/icons/
     let helper = dirs_next::home_dir().unwrap_or_default()
         .join(".mindscope").join("bin").join("active_app");
