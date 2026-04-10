@@ -683,18 +683,14 @@ pub fn run() {
                 // s.audio_recorder.start(); // Disabled: triggers permission dialog
             }
 
-            // Window is a fixed overlay anchored above the Dock.
-            // The bar sits in the bottom 70px via CSS; panels render above it
-            // in the already-allocated transparent space. No resize when
-            // panels open/close. We compute Y from full frame_h minus an
-            // explicit Dock safety buffer so the window never reaches the Dock.
+            // Fullscreen transparent window on main screen, start hidden.
+            // CSS handles all layout — bar lives at the bottom of screen.h
+            // (visibleFrame = excludes Dock + menu bar automatically).
+            // This matches the stable backup version that worked correctly.
             if let Some(window) = app.get_webview_window("main") {
                 let screen = get_main_screen();
-                let window_height = 600.0;
-                let dock_buffer = 90.0; // generous Dock clearance (Dock + margin)
-                let window_y = screen.frame_y + screen.frame_h - dock_buffer - window_height;
-                let _ = window.set_size(tauri::LogicalSize::new(screen.w, window_height));
-                let _ = window.set_position(tauri::LogicalPosition::new(screen.x, window_y));
+                let _ = window.set_size(tauri::LogicalSize::new(screen.frame_w, screen.frame_h));
+                let _ = window.set_position(tauri::LogicalPosition::new(screen.frame_x, screen.frame_y));
                 panel::configure_bar_mode(&window);
                 let _ = window.hide();
             }

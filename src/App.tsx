@@ -4,7 +4,7 @@ import SearchPanel from "./components/SearchPanel";
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough } from "./lib/commands";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
@@ -756,9 +756,11 @@ function App() {
   }
 
   // === Bar mode — white glass, original two-row layout ===
+  // Outer div has pointerEvents:"none" so clicks on transparent area pass through.
+  // Bar + panels have pointerEvents:"auto" so they receive clicks.
   return (
     <div
-      style={{ width: "100vw", height: "100vh", background: "transparent" }}
+      style={{ width: "100vw", height: "100vh", background: "transparent", pointerEvents: "none" }}
       onClick={() => {
         if (anyPanelOpen) {
           setShowBrief(false); setShowAI(false); setShowSettings(false);
@@ -768,13 +770,8 @@ function App() {
     >
     <div
       onClick={(e) => e.stopPropagation()}
-      onMouseEnter={() => { setClickthrough(false).catch(() => {}); }}
-      onMouseLeave={() => {
-        // Only re-enable clickthrough if no panel is open
-        if (!anyPanelOpen) setClickthrough(true).catch(() => {});
-      }}
       style={{
-        position: "fixed", bottom: 0, left: 0, right: 0, height: 70,
+        position: "fixed", bottom: 58, left: 0, right: 0, height: 70,
         background: "rgba(255, 255, 255, 0.78)",
         backdropFilter: "blur(40px) saturate(200%)",
         WebkitBackdropFilter: "blur(40px) saturate(200%)",
