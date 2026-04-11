@@ -74,6 +74,91 @@ async fn search_handler(Query(p): Query<SearchQ>) -> axum::Json<serde_json::Valu
     axum::Json(serde_json::json!({ "results": items, "total": items.len() }))
 }
 
+/// GET /search_meetings?q=...&limit=...
+/// Linear-scan search over audio transcripts (last 14 days).
+/// Returns matching segments with a snippet around the first match for highlighting.
+async fn search_meetings_handler(Query(p): Query<SearchQ>) -> axum::Json<serde_json::Value> {
+    let query_raw = p.q.unwrap_or_default();
+    let query = query_raw.trim().to_lowercase();
+    let limit = p.limit.unwrap_or(30) as usize;
+
+    if query.is_empty() {
+        return axum::Json(serde_json::json!({ "results": [], "total": 0 }));
+    }
+
+    // Scan the last 14 days of audio indexes by walking back day-by-day
+    // from `today()`. Uses the same date format as the audio pipeline.
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    let today_str = today();
+    let mut date = today_str.clone();
+
+    for _ in 0..14 {
+        let segments = audio::load_audio_segments(&date);
+        for seg in &segments {
+            if seg.transcript.is_empty() { continue; }
+            let hay = seg.transcript.to_lowercase();
+            if !hay.contains(&query) { continue; }
+
+            // Extract a ~140-char window around the first match for highlighting.
+            let idx = hay.find(&query).unwrap_or(0);
+            let chars: Vec<char> = seg.transcript.chars().collect();
+            let match_char_idx = seg.transcript[..idx].chars().count();
+            let start = match_char_idx.saturating_sub(50);
+            let end = (match_char_idx + query.chars().count() + 90).min(chars.len());
+            let snippet: String = chars[start..end].iter().collect();
+
+            hits.push(serde_json::json!({
+                "date": date,
+                "timestamp": seg.timestamp,
+                "session_id": seg.session_id,
+                "session_type": seg.session_type,
+                "duration_secs": seg.duration_secs,
+                "transcript": seg.transcript,
+                "snippet": if start > 0 { format!("…{}", snippet) } else { snippet },
+                "match_offset": match_char_idx,
+                "match_length": query.chars().count(),
+            }));
+            if hits.len() >= limit { break; }
+        }
+        if hits.len() >= limit { break; }
+
+        // Walk back one day — parse YYYY-MM-DD and subtract 1 day.
+        if let Some(prev) = prev_day(&date) {
+            date = prev;
+        } else { break; }
+    }
+
+    axum::Json(serde_json::json!({ "results": hits, "total": hits.len() }))
+}
+
+/// Walk back one calendar day given a YYYY-MM-DD string.
+fn prev_day(date: &str) -> Option<String> {
+    let (y, m, d) = {
+        let parts: Vec<&str> = date.split('-').collect();
+        if parts.len() != 3 { return None; }
+        (parts[0].parse::<i32>().ok()?, parts[1].parse::<u32>().ok()?, parts[2].parse::<u32>().ok()?)
+    };
+    let (ny, nm, nd) = if d > 1 {
+        (y, m, d - 1)
+    } else if m > 1 {
+        let prev_m = m - 1;
+        let dim = days_in_month(y, prev_m);
+        (y, prev_m, dim)
+    } else {
+        (y - 1, 12, 31)
+    };
+    Some(format!("{:04}-{:02}-{:02}", ny, nm, nd))
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 },
+        _ => 30,
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct TimelineQ { date: Option<String> }
 
@@ -206,6 +291,7 @@ pub async fn start(port: u16) -> Result<(), String> {
         .route("/frames/:frame_id/text", get(get_frame_text))
         .route("/frame", get(get_frame_by_path))
         .route("/search", get(search_handler))
+        .route("/search_meetings", get(search_meetings_handler))
         .route("/timeline", get(timeline_handler))
         .route("/app-icon/:app_name", get(get_app_icon))
         .route("/video/frame", get(get_video_frame))

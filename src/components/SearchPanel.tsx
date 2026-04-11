@@ -136,6 +136,34 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
   const [meetingSessions, setMeetingSessions] = useState<MeetingSession[]>([]);
   const [expandedSession, setExpandedSession] = useState<MeetingSession | null>(null);
 
+  // Server-side transcript search hits (only used when tab=meetings + query present)
+  interface MeetingHit {
+    date: string;
+    timestamp: string;
+    session_id: string;
+    session_type: string;
+    duration_secs: number;
+    transcript: string;
+    snippet: string;
+    match_offset: number;
+    match_length: number;
+  }
+  const [meetingHits, setMeetingHits] = useState<MeetingHit[]>([]);
+  const [meetingSearchLoading, setMeetingSearchLoading] = useState(false);
+  useEffect(() => {
+    if (tab !== "meetings") { setMeetingHits([]); return; }
+    const q = query.trim();
+    if (!q) { setMeetingHits([]); return; }
+    setMeetingSearchLoading(true);
+    const controller = new AbortController();
+    fetch(`http://127.0.0.1:9457/search_meetings?q=${encodeURIComponent(q)}&limit=30`, { signal: controller.signal })
+      .then((r) => r.json())
+      .then((d) => setMeetingHits(d.results || []))
+      .catch(() => {})
+      .finally(() => setMeetingSearchLoading(false));
+    return () => controller.abort();
+  }, [tab, query]);
+
   // Load audio segments when Meetings tab is active, group by session_id
   useEffect(() => {
     if (tab !== "meetings") return;
@@ -467,6 +495,53 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
             <p style={{ fontSize: 13, color: "#9ca3af", textAlign: "center" }}>No starred items</p>
             <p style={{ fontSize: 11, color: "#c4c4c6", textAlign: "center" }}>Star important moments to find them quickly</p>
           </div>
+        ) : tab === "meetings" && query.trim() ? (
+          meetingSearchLoading ? (
+            <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>Searching transcripts…</p>
+          ) : meetingHits.length === 0 ? (
+            <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>
+              No transcript matches for "{query.trim()}"
+            </p>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "4px 2px" }}>
+              {meetingHits.map((hit, i) => {
+                const { label: typeLabel, color: typeColor } = getSessionTypeStyle(hit.session_type || "unknown");
+                // Split snippet at the match location for highlighting
+                // The snippet may have a leading "…" if trimmed from the left.
+                // Find the match inside the snippet by case-insensitive search.
+                const lower = hit.snippet.toLowerCase();
+                const qLower = query.trim().toLowerCase();
+                const idxInSnippet = lower.indexOf(qLower);
+                const hasMatch = idxInSnippet >= 0;
+                const before = hasMatch ? hit.snippet.slice(0, idxInSnippet) : hit.snippet;
+                const matched = hasMatch ? hit.snippet.slice(idxInSnippet, idxInSnippet + qLower.length) : "";
+                const after = hasMatch ? hit.snippet.slice(idxInSnippet + qLower.length) : "";
+                const when = hit.timestamp.length >= 16 ? hit.timestamp.replace("T", " ").slice(0, 16) : hit.timestamp;
+                return (
+                  <div key={`${hit.session_id}-${hit.timestamp}-${i}`} style={{
+                    background: "#fff", borderRadius: 10, border: "1px solid rgba(0,0,0,0.06)",
+                    padding: "10px 12px", display: "flex", flexDirection: "column", gap: 6,
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{
+                        fontSize: 9, fontWeight: 600, color: "#fff",
+                        background: typeColor, padding: "1px 6px", borderRadius: 20,
+                        textTransform: "uppercase", letterSpacing: 0.3,
+                      }}>{typeLabel}</span>
+                      <span style={{ fontSize: 11, color: "#86868b" }}>{when}</span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ fontSize: 10, color: "#aeaeb2" }}>{Math.round(hit.duration_secs)}s</span>
+                    </div>
+                    <div style={{ fontSize: 12, color: "#374151", lineHeight: 1.55 }}>
+                      {before}
+                      <mark style={{ background: "rgba(251, 191, 36, 0.55)", color: "#1d1d1f", padding: "0 2px", borderRadius: 2 }}>{matched}</mark>
+                      {after}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )
         ) : tab === "meetings" && !query.trim() ? (
           meetingSessions.length === 0 ? (
             <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 13, padding: 24 }}>No meeting sessions today</p>

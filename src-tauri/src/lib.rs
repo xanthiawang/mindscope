@@ -276,12 +276,18 @@ fn toggle_audio(state: State<'_, ManagedState>) -> bool {
         let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
         capture::recorder::suppress_auto_audio();
         capture::recorder::end_audio_session();
+        // Clear the manual meeting state so the Transcript tab stops showing
+        // the "active session" ribbon.
+        capture::recorder::mark_manual_meeting_end();
         false
     } else {
         // Starting manually — create a new session
         let session_type = capture::recorder::detect_meeting_app_name()
             .unwrap_or_else(|| "manual".to_string());
         capture::recorder::start_audio_session(&session_type);
+        // Publish manual session as an active "meeting" so the frontend
+        // Transcript tab polls and renders the live transcript.
+        capture::recorder::mark_manual_meeting_start(&session_type);
         state.audio_recorder.start()
     }
 }
@@ -708,6 +714,9 @@ pub fn run() {
                             } else {
                                 let _ = w.show();
                                 let _ = w.set_focus();
+                                // Default to catching clicks so bar receives interaction;
+                                // the bar's onMouseLeave enables click-through when the
+                                // cursor leaves the bar area.
                                 panel::set_clickthrough(&w, false);
                             }
                         }

@@ -62,6 +62,26 @@ pub fn get_meeting_state() -> (bool, String, i64) {
     (active, app, start)
 }
 
+/// Mark the start of a manual recording session (mic button pressed).
+/// Publishes MEETING_ACTIVE/MEETING_START so the Transcript tab polls can
+/// show the live transcript exactly like an auto-detected meeting.
+pub fn mark_manual_meeting_start(label: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    MEETING_ACTIVE.store(true, Ordering::Relaxed);
+    MEETING_START.store(ts, Ordering::Relaxed);
+    if let Ok(mut m) = MEETING_APP.lock() { *m = Some(label.to_string()); }
+}
+
+/// Mark the end of a manual recording session (mic button released).
+pub fn mark_manual_meeting_end() {
+    MEETING_ACTIVE.store(false, Ordering::Relaxed);
+    MEETING_START.store(0, Ordering::Relaxed);
+    if let Ok(mut m) = MEETING_APP.lock() { *m = None; }
+}
+
 pub struct Recorder {
     running: Arc<AtomicBool>,
     interval_secs: u64,
