@@ -74,6 +74,24 @@ async fn search_handler(Query(p): Query<SearchQ>) -> axum::Json<serde_json::Valu
     axum::Json(serde_json::json!({ "results": items, "total": items.len() }))
 }
 
+/// GET /debug/meeting — dump all meeting-related internal state for live debugging.
+async fn debug_meeting_handler() -> axum::Json<serde_json::Value> {
+    let mut dump = recorder::dump_debug_state();
+    // Also include ffmpeg process presence for correlation.
+    let ffmpeg_running = std::process::Command::new("pgrep")
+        .args(["-f", "ffmpeg.*avfoundation"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if let Some(obj) = dump.as_object_mut() {
+        obj.insert("ffmpeg_avfoundation_running".to_string(), serde_json::json!(ffmpeg_running));
+        obj.insert("timestamp_ms".to_string(), serde_json::json!(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+        ));
+    }
+    axum::Json(dump)
+}
+
 /// GET /search_meetings?q=...&limit=...
 /// Linear-scan search over audio transcripts (last 14 days).
 /// Returns matching segments with a snippet around the first match for highlighting.
@@ -292,6 +310,7 @@ pub async fn start(port: u16) -> Result<(), String> {
         .route("/frame", get(get_frame_by_path))
         .route("/search", get(search_handler))
         .route("/search_meetings", get(search_meetings_handler))
+        .route("/debug/meeting", get(debug_meeting_handler))
         .route("/timeline", get(timeline_handler))
         .route("/app-icon/:app_name", get(get_app_icon))
         .route("/video/frame", get(get_video_frame))

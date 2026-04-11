@@ -244,19 +244,32 @@ fn start_audio(state: State<'_, ManagedState>) -> Result<bool, String> {
         return Err("Microphone permission not granted. Click 'Enable' to request permission.".into());
     }
     let state = state.lock().unwrap();
+    capture::recorder::log_meeting_event("start_audio ENTRY", capture::recorder::get_meeting_state().0);
     // Start a manual session (or auto if meeting already active)
     let (existing_id, _) = capture::recorder::get_current_session();
-    if existing_id.is_empty() {
-        let session_type = capture::recorder::detect_meeting_app_name()
+    let session_type = if existing_id.is_empty() {
+        let t = capture::recorder::detect_meeting_app_name()
             .unwrap_or_else(|| "manual".to_string());
-        capture::recorder::start_audio_session(&session_type);
-    }
-    Ok(state.audio_recorder.start())
+        capture::recorder::start_audio_session(&t);
+        t
+    } else {
+        capture::recorder::get_current_session().1
+    };
+    // Publish manual session as an active "meeting" so the frontend
+    // Transcript tab polls and renders the live transcript + red-dot.
+    capture::recorder::mark_manual_meeting_start(&session_type);
+    let started = state.audio_recorder.start();
+    capture::recorder::log_meeting_event(
+        &format!("start_audio DONE audio_recorder.start()={}", started),
+        capture::recorder::get_meeting_state().0,
+    );
+    Ok(started)
 }
 
 #[tauri::command]
 fn stop_audio(state: State<'_, ManagedState>) {
     let state = state.lock().unwrap();
+    capture::recorder::log_meeting_event("stop_audio ENTRY", capture::recorder::get_meeting_state().0);
     state.audio_recorder.stop();
     // Kill any ffmpeg child processes
     let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
@@ -264,14 +277,23 @@ fn stop_audio(state: State<'_, ManagedState>) {
     capture::recorder::suppress_auto_audio();
     // End the session
     capture::recorder::end_audio_session();
+    // Clear the manual meeting flags so the Transcript tab stops indicating active.
+    capture::recorder::mark_manual_meeting_end();
 }
 
 /// Toggle audio recording on/off (for manual mic button)
 #[tauri::command]
 fn toggle_audio(state: State<'_, ManagedState>) -> bool {
     let state = state.lock().unwrap();
-    let any_recording = state.audio_recorder.is_running() || is_ffmpeg_recording();
+    let is_running = state.audio_recorder.is_running();
+    let ffmpeg_running = is_ffmpeg_recording();
+    let any_recording = is_running || ffmpeg_running;
+    capture::recorder::log_meeting_event(
+        &format!("toggle_audio ENTRY is_running={} ffmpeg={} any={}", is_running, ffmpeg_running, any_recording),
+        capture::recorder::get_meeting_state().0,
+    );
     if any_recording {
+        capture::recorder::log_meeting_event("toggle_audio branch=STOP", true);
         state.audio_recorder.stop();
         let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
         capture::recorder::suppress_auto_audio();
@@ -281,6 +303,7 @@ fn toggle_audio(state: State<'_, ManagedState>) -> bool {
         capture::recorder::mark_manual_meeting_end();
         false
     } else {
+        capture::recorder::log_meeting_event("toggle_audio branch=START", false);
         // Starting manually — create a new session
         let session_type = capture::recorder::detect_meeting_app_name()
             .unwrap_or_else(|| "manual".to_string());
@@ -288,7 +311,12 @@ fn toggle_audio(state: State<'_, ManagedState>) -> bool {
         // Publish manual session as an active "meeting" so the frontend
         // Transcript tab polls and renders the live transcript.
         capture::recorder::mark_manual_meeting_start(&session_type);
-        state.audio_recorder.start()
+        let started = state.audio_recorder.start();
+        capture::recorder::log_meeting_event(
+            &format!("toggle_audio START complete audio_recorder.start()={}", started),
+            capture::recorder::get_meeting_state().0,
+        );
+        started
     }
 }
 

@@ -17,6 +17,32 @@ static MEETING_START: AtomicI64 = AtomicI64::new(0);
 // User manually stopped auto-recording this session — don't restart until meeting ends
 static MEETING_AUDIO_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
+/// Append a single line to ~/.mindscope/data/meeting_debug.log to trace every
+/// write to MEETING_ACTIVE. Used while hunting the manual-mic-transcript bug.
+/// Safe to call from any thread.
+pub fn log_meeting_event(reason: &str, new_value: bool) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let line = format!(
+        "{} MEETING_ACTIVE={} reason={}\n",
+        now, new_value, reason
+    );
+    let path = dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".mindscope")
+        .join("data")
+        .join("meeting_debug.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 // Current audio session — activity/task based (one meeting = one session, manual recording = another)
 static CURRENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 static CURRENT_SESSION_TYPE: Mutex<Option<String>> = Mutex::new(None);
@@ -73,6 +99,7 @@ pub fn mark_manual_meeting_start(label: &str) {
     MEETING_ACTIVE.store(true, Ordering::Relaxed);
     MEETING_START.store(ts, Ordering::Relaxed);
     if let Ok(mut m) = MEETING_APP.lock() { *m = Some(label.to_string()); }
+    log_meeting_event(&format!("mark_manual_meeting_start({})", label), true);
 }
 
 /// Mark the end of a manual recording session (mic button released).
@@ -80,6 +107,22 @@ pub fn mark_manual_meeting_end() {
     MEETING_ACTIVE.store(false, Ordering::Relaxed);
     MEETING_START.store(0, Ordering::Relaxed);
     if let Ok(mut m) = MEETING_APP.lock() { *m = None; }
+    log_meeting_event("mark_manual_meeting_end", false);
+}
+
+/// Dump all meeting-related state for the /debug/meeting endpoint.
+pub fn dump_debug_state() -> serde_json::Value {
+    let (active, app, start) = get_meeting_state();
+    let (session_id, session_type) = get_current_session();
+    let suppressed = MEETING_AUDIO_SUPPRESSED.load(Ordering::Relaxed);
+    serde_json::json!({
+        "MEETING_ACTIVE": active,
+        "MEETING_APP": app,
+        "MEETING_START": start,
+        "MEETING_AUDIO_SUPPRESSED": suppressed,
+        "CURRENT_SESSION_ID": session_id,
+        "CURRENT_SESSION_TYPE": session_type,
+    })
 }
 
 pub struct Recorder {
@@ -200,7 +243,13 @@ impl Recorder {
                     let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
                 }
 
-                if in_meeting && !meeting_audio_active && !suppressed {
+                // Is a manual recording session already running? (toggle_audio
+                // sets MEETING_ACTIVE via mark_manual_meeting_start but does
+                // NOT set the loop-local meeting_audio_active.)
+                let manual_session_running =
+                    MEETING_ACTIVE.load(Ordering::Relaxed) && !meeting_audio_active;
+
+                if in_meeting && !meeting_audio_active && !suppressed && !manual_session_running {
                     let has_mic = audio::check_mic_permission();
                     let log_path = db::data_dir().join("debug.log");
                     let _ = std::fs::OpenOptions::new()
@@ -222,29 +271,53 @@ impl Recorder {
                         MEETING_ACTIVE.store(true, Ordering::Relaxed);
                         MEETING_START.store(meeting_start_ts, Ordering::Relaxed);
                         if let Ok(mut m) = MEETING_APP.lock() { *m = Some(meeting_app_name.clone()); }
+                        log_meeting_event(&format!("auto_start({})", app_name), true);
                         log::info!("MindScope: Meeting detected ({}), auto-started audio", app_name);
                     }
-                } else if !in_meeting && (meeting_audio_active || suppressed) {
+                } else if !in_meeting && meeting_audio_active {
+                    // AUTO session ended (meeting app closed). Clean up the
+                    // auto state. If a manual recording has piggybacked on
+                    // top (toggle_audio called while auto was still running),
+                    // preserve the global flags so its Transcript tab stays
+                    // alive — we can detect that because toggle_audio leaves
+                    // CURRENT_SESSION_TYPE == "manual".
                     auto_audio.stop();
                     meeting_audio_active = false;
-                    end_audio_session(); // close session when meeting ends
-                    // Clear suppression when meeting ends
-                    MEETING_AUDIO_SUPPRESSED.store(false, Ordering::Relaxed);
-                    // Clear global meeting state
-                    MEETING_ACTIVE.store(false, Ordering::Relaxed);
-                    MEETING_START.store(0, Ordering::Relaxed);
-                    if let Ok(mut m) = MEETING_APP.lock() { *m = None; }
-                    let end_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default().as_micros() as i64;
-                    log::info!("MindScope: Meeting ended, generating vault notes...");
-                    // Spawn background thread to generate vault meeting notes
-                    let m_app = meeting_app_name.clone();
-                    let m_start = meeting_start_ts;
-                    let m_win = window_name.clone();
-                    thread::spawn(move || {
-                        generate_meeting_vault(m_start, end_ts, &m_app, &m_win);
-                    });
+
+                    let (_, cur_type) = get_current_session();
+                    let manual_owned = cur_type == "manual";
+
+                    if !manual_owned {
+                        end_audio_session();
+                        MEETING_AUDIO_SUPPRESSED.store(false, Ordering::Relaxed);
+                        MEETING_ACTIVE.store(false, Ordering::Relaxed);
+                        MEETING_START.store(0, Ordering::Relaxed);
+                        if let Ok(mut m) = MEETING_APP.lock() { *m = None; }
+                        log_meeting_event("auto_cleanup_meeting_ended", false);
+                        let end_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_micros() as i64;
+                        log::info!("MindScope: Meeting ended, generating vault notes...");
+                        let m_app = meeting_app_name.clone();
+                        let m_start = meeting_start_ts;
+                        let m_win = window_name.clone();
+                        thread::spawn(move || {
+                            generate_meeting_vault(m_start, end_ts, &m_app, &m_win);
+                        });
+                    } else {
+                        log_meeting_event("auto_cleanup_SKIPPED_manual_owned", MEETING_ACTIVE.load(Ordering::Relaxed));
+                    }
+                    // If manual_owned: manual session is running on its own ffmpeg child —
+                    // leave MEETING_ACTIVE/START/APP and CURRENT_SESSION_* alone.
+                } else if !in_meeting && suppressed && !meeting_audio_active {
+                    // Suppression is set but the auto loop was never itself
+                    // recording. Only clear the suppression if no manual
+                    // session is currently running — a manual recording
+                    // publishes MEETING_ACTIVE=true via mark_manual_meeting_start,
+                    // so treat that as "hands off the global flags".
+                    if !MEETING_ACTIVE.load(Ordering::Relaxed) {
+                        MEETING_AUDIO_SUPPRESSED.store(false, Ordering::Relaxed);
+                    }
                 }
 
                 // App exclusion check
