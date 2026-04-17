@@ -317,84 +317,171 @@ fn do_synapse_update() -> Result<String, String> {
         .ok_or("Claude CLI not found — install via `brew install claude`")?;
 
     // Pre-flight: enforce hard size caps BEFORE asking Claude to touch anything.
-    // This is cheap (local file I/O) and prevents Claude from being fed a
-    // 20 KB bloated file and dutifully preserving all the bloat.
     trim_working_memory(&vault.join("_working-memory.md"));
     trim_warm_memory(&vault.join("_warm-memory.md"));
 
     let activity = gather_recent_activity();
 
-    // Section-scoped, Edit-only, hard-capped prompt routed through vault-updater.
+    // Read vault files in Rust so Claude doesn't need Read/Edit tools.
+    // This avoids the "400 tool use concurrency" error that occurs when
+    // Claude Desktop or Claude Code is running simultaneously.
+    let wm_path = vault.join("_working-memory.md");
+    let warm_path = vault.join("_warm-memory.md");
+    let wm_content = fs::read_to_string(&wm_path).unwrap_or_default();
+    let warm_content = fs::read_to_string(&warm_path).unwrap_or_default();
+
+    // Tool-free prompt: file contents are inlined, Claude outputs the
+    // FULL updated file contents, Rust writes them back.
+    // No Read/Edit tools needed → no concurrency conflict with Claude Desktop.
     let prompt = format!(
-        "You are the MindScope Synapse loop. Update the vault based on recent activity.\n\n\
+        "You are the MindScope Synapse loop. You will be given the current vault files \
+         and recent screen/audio activity. Your job is to output the UPDATED file contents.\n\n\
+         ═══════════════ CURRENT _working-memory.md ═══════════════\n\
+         {}\n\
+         ═══════════════ CURRENT _warm-memory.md ═══════════════\n\
+         {}\n\
          ═══════════════ RECENT ACTIVITY (last 2 hours) ═══════════════\n\
          {}\n\
          ══════════════════════════════════════════════════════════════\n\n\
-         🚨 CRITICAL RULES — violations cause rollback:\n\n\
-         1. **Edit tool ONLY.** Use `old_string → new_string` on existing files. \
-            NEVER use the Write tool on `_working-memory.md` or `_warm-memory.md`. \
-            Write is permitted only for creating brand-new `user.*.md` / `proj.*.md` files.\n\n\
-         2. **Section-scoped edits.** When you edit a managed file, only touch \
-            content inside these specific headings:\n\
-            - `_working-memory.md` → `## Current Focus`, `## Today's Activity`, \
-              `## Recent People`, `## Source Sync Status`\n\
-            - `_warm-memory.md` → `## Active Follow-Ups`, `## Project Momentum`, \
-              `## Collaborator State`, `## Needs Triage`, `## Recent Decisions`\n\
-            NEVER touch `## User Notes` — that's user-owned.\n\n\
-         3. **Hard size caps.** After your edits:\n\
-            - `_working-memory.md` must stay ≤ 4000 chars\n\
-            - `_warm-memory.md` must stay ≤ 8000 chars\n\
-            If you're about to exceed, your FIRST edit must DELETE the oldest \
-            rows in `## Today's Activity` or the oldest entries in `## Recent People`.\n\n\
-         4. **Auto-decay rules (apply every pass):**\n\
-            - Today's Activity table: keep max 8 rows; drop oldest\n\
-            - Recent People: keep max 6 entries; drop least-recent\n\
-            - Unchecked tasks `- [ ]` older than 14 days → move from _working-memory.md to \
-              _warm-memory.md `## Needs Triage`\n\
-            - Follow-ups > 7 days old with no completion → mark `⚠ Overdue`\n\n\
-         5. **Preserve user edits.** If a section has content that clearly wasn't \
-            written by you (different style, explicit notes, etc.), merge around it. \
-            Don't clobber.\n\n\
-         6. **Never invent data.** If the activity log is empty or sparse, make \
-            minimal edits (just update the sync timestamp) and stop.\n\n\
-         7. **Use the `sync/vault-updater` skill** for managed file edits — it \
-            enforces section-scoped rewrites correctly.\n\n\
-         ══════════════════════════════════════════════════════════════\n\
-         TASK:\n\
-         1. Read `_working-memory.md`.\n\
-         2. Apply Edit-tool patches to update Current Focus + Today's Activity + \
-            Recent People + Source Sync Status based on the activity above.\n\
-         3. Read `_warm-memory.md`.\n\
-         4. Apply Edit-tool patches to bubble up any task older than 14 days to \
-            Needs Triage, and update Collaborator State for anyone in Recent People.\n\
-         5. Output a one-line summary of what you changed.\n\n\
-         Be concise. Max 80 chars per focus line. Confidence < 0.5 → don't apply.",
-        activity
+         RULES:\n\
+         1. Only update content inside these managed sections:\n\
+            - _working-memory.md: ## Current Focus, ## Today's Activity, ## Recent People, ## Source Sync Status\n\
+            - _warm-memory.md: ## Active Follow-Ups, ## Project Momentum, ## Collaborator State, ## Needs Triage, ## Recent Decisions\n\
+         2. NEVER modify ## User Notes or anything below USER-OWNED ZONE. Copy them EXACTLY as-is.\n\
+         3. Hard caps: _working-memory.md ≤ 4000 chars, _warm-memory.md ≤ 8000 chars.\n\
+         4. Today's Activity: max 8 rows, drop oldest. Recent People: max 6 entries.\n\
+         5. Never invent data. If activity is empty/sparse, keep existing content mostly unchanged.\n\
+         6. Be concise. Max 80 chars per focus line.\n\
+         7. Copy ALL frontmatter (--- block) and structural comments EXACTLY.\n\n\
+         OUTPUT FORMAT — respond with exactly two fenced blocks, nothing else:\n\n\
+         ```working-memory\n\
+         (entire updated _working-memory.md content here)\n\
+         ```\n\n\
+         ```warm-memory\n\
+         (entire updated _warm-memory.md content here)\n\
+         ```",
+        wm_content, warm_content, activity
     );
 
-    log::info!("MindScope synapse: invoking Claude CLI (Haiku) in {:?}", vault);
+    log::info!("MindScope synapse: invoking Claude CLI (Haiku, tool-free mode)");
 
-    // Route through Haiku to cut background token cost ~12x vs Sonnet.
-    // Synapse updates are "read + summarize + patch" — Haiku handles this well.
+    // --allowedTools "": prevent Claude CLI from registering ANY tools with the API.
+    // File contents are in the prompt; updated files come back as fenced text.
+    // This eliminates the "400 tool use concurrency" error that fires when
+    // Claude Desktop or Claude Code sessions are running simultaneously.
     let output = Command::new(&claude_path)
-        .args(["-p", &prompt, "--model", "claude-haiku-4-5"])
+        .args(["-p", &prompt, "--model", "claude-haiku-4-5", "--allowedTools", ""])
         .current_dir(&vault)
         .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
         .map_err(|e| format!("failed to run claude: {}", e))?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        // Post-flight: if Claude ignored the cap rules (rare but possible),
-        // enforce again. This is idempotent.
-        trim_working_memory(&vault.join("_working-memory.md"));
-        trim_warm_memory(&vault.join("_warm-memory.md"));
-        log::info!("MindScope synapse: update complete");
-        Ok(stdout)
-    } else {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(format!("claude exited with status {}: {}", output.status, stderr))
+        return Err(format!("claude exited with status {}: {}", output.status, stderr));
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Parse the two fenced blocks and write them back to disk.
+    apply_fenced_output(&vault, &stdout, &wm_content, &warm_content)?;
+
+    // Post-flight: enforce caps again (idempotent safety net).
+    trim_working_memory(&wm_path);
+    trim_warm_memory(&warm_path);
+    log::info!("MindScope synapse: update complete");
+    Ok(stdout)
+}
+
+/// Extract a fenced code block by its language tag from Claude's response.
+/// Looks for ```tag\n...\n``` and returns the inner content.
+fn extract_fenced_block(response: &str, tag: &str) -> Option<String> {
+    let opener = format!("```{}", tag);
+    let start = response.find(&opener)?;
+    let content_start = response[start..].find('\n')? + start + 1;
+    // Find the closing ``` — must be on its own line
+    let rest = &response[content_start..];
+    let end = rest.find("\n```")
+        .map(|p| content_start + p)
+        .or_else(|| {
+            // Also try ``` at end of string
+            if rest.ends_with("```") {
+                Some(content_start + rest.len() - 3)
+            } else {
+                None
+            }
+        })?;
+    Some(response[content_start..end].to_string())
+}
+
+/// Parse Claude's fenced-block response and write updated files back to vault.
+/// Validates: USER-OWNED ZONE preserved, size caps respected.
+fn apply_fenced_output(
+    vault: &Path,
+    response: &str,
+    original_wm: &str,
+    original_warm: &str,
+) -> Result<(), String> {
+
+    // Helper: ensure USER-OWNED ZONE content is preserved exactly
+    fn preserve_user_zone(original: &str, updated: &str) -> String {
+        let zone_marker = "## User Notes";
+        let orig_zone = original.find(zone_marker)
+            .map(|pos| &original[pos..]);
+        let updated_zone_pos = updated.find(zone_marker);
+
+        match (orig_zone, updated_zone_pos) {
+            (Some(orig_tail), Some(pos)) => {
+                // Replace whatever Claude wrote below ## User Notes with original
+                format!("{}{}", &updated[..pos], orig_tail)
+            }
+            (Some(orig_tail), None) => {
+                // Claude dropped the zone entirely — append it
+                format!("{}\n\n{}", updated.trim_end(), orig_tail)
+            }
+            _ => updated.to_string(),
+        }
+    }
+
+    let mut applied = 0;
+
+    // Process _working-memory.md
+    if let Some(new_wm) = extract_fenced_block(response, "working-memory") {
+        let safe_wm = preserve_user_zone(original_wm, &new_wm);
+        if safe_wm.len() <= WORKING_MEMORY_HARD_CAP + 500 {
+            let wm_path = vault.join("_working-memory.md");
+            fs::write(&wm_path, &safe_wm)
+                .map_err(|e| format!("failed to write _working-memory.md: {}", e))?;
+            log::info!("MindScope synapse: updated _working-memory.md ({} → {} chars)",
+                       original_wm.len(), safe_wm.len());
+            applied += 1;
+        } else {
+            log::warn!("MindScope synapse: _working-memory.md update exceeds cap ({}), skipping",
+                       safe_wm.len());
+        }
+    }
+
+    // Process _warm-memory.md
+    if let Some(new_warm) = extract_fenced_block(response, "warm-memory") {
+        let safe_warm = preserve_user_zone(original_warm, &new_warm);
+        if safe_warm.len() <= WARM_MEMORY_HARD_CAP + 500 {
+            let warm_path = vault.join("_warm-memory.md");
+            fs::write(&warm_path, &safe_warm)
+                .map_err(|e| format!("failed to write _warm-memory.md: {}", e))?;
+            log::info!("MindScope synapse: updated _warm-memory.md ({} → {} chars)",
+                       original_warm.len(), safe_warm.len());
+            applied += 1;
+        } else {
+            log::warn!("MindScope synapse: _warm-memory.md update exceeds cap ({}), skipping",
+                       safe_warm.len());
+        }
+    }
+
+    if applied == 0 {
+        log::warn!("MindScope synapse: no fenced blocks found in response, no files updated");
+    }
+
+    Ok(())
 }
 
 fn find_claude_cli() -> Option<PathBuf> {
