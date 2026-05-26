@@ -177,7 +177,7 @@ pub fn transcribe(audio_path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-/// Convert m4a to WAV 16kHz mono using afconvert (macOS)
+/// Convert audio to WAV 16kHz mono using platform-specific converter
 fn convert_to_wav(audio_path: &Path) -> Result<PathBuf, String> {
     let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "wav" {
@@ -185,22 +185,8 @@ fn convert_to_wav(audio_path: &Path) -> Result<PathBuf, String> {
     }
 
     let wav_path = audio_path.with_extension("wav");
-    let status = std::process::Command::new("afconvert")
-        .args([
-            "-d", "LEI16",           // 16-bit little-endian integer
-            "-c", "1",               // mono
-            "-r", "16000",           // 16kHz
-            audio_path.to_str().unwrap_or(""),
-            wav_path.to_str().unwrap_or(""),
-        ])
-        .status()
-        .map_err(|e| format!("afconvert failed: {}", e))?;
-
-    if status.success() {
-        Ok(wav_path)
-    } else {
-        Err("afconvert failed".into())
-    }
+    super::platform::convert_audio_to_wav(audio_path, &wav_path)?;
+    Ok(wav_path)
 }
 
 /// Load WAV file as f32 samples normalized to [-1, 1]

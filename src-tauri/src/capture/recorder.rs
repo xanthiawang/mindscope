@@ -149,6 +149,7 @@ impl Recorder {
             let mut last_ocr_text = String::new();
             let mut last_app = String::new();
             let mut encoder_started = false;
+            let mut encoder_attempted = false; // don't retry after first failure
             let mut last_frame_path: Option<String> = None;
             let mut skip_count: u64 = 0;
             let frame_buffer = db::FrameBuffer::new(5, 10);
@@ -188,8 +189,9 @@ impl Recorder {
                     }
                 }
 
-                // Start HEVC encoder on first successful permission check
-                if !encoder_started {
+                // Start HEVC encoder on first successful permission check (try once only)
+                if !encoder_started && !encoder_attempted {
+                    encoder_attempted = true;
                     match video::start_encoder() {
                         Ok(_) => { encoder_started = true; }
                         Err(e) => { log::warn!("MindScope: encoder start failed: {}", e); }
@@ -603,10 +605,11 @@ fn call_claude_cli(prompt: &str) -> Option<String> {
     // Run Claude inside the MindScope vault so it picks up CLAUDE.md + skills
     let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
     let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
-    let output = std::process::Command::new("/opt/homebrew/bin/claude")
+    let claude_path = super::platform::find_claude_cli()
+        .unwrap_or_else(|| "claude".to_string());
+    let output = std::process::Command::new(&claude_path)
         .args(["-p", prompt, "--model", "claude-haiku-4-5"])
         .current_dir(&cwd)
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
         .ok()?;
     if output.status.success() {

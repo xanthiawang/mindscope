@@ -50,6 +50,12 @@
     ],
     "macOS": {
       "infoPlist": "Info.plist"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "allowDowngrades": true
     }
   }
 }

@@ -4,7 +4,7 @@ import SearchPanel from "./components/SearchPanel";
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough } from "./lib/commands";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough, setInteractiveZone } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
@@ -467,6 +467,12 @@ function App() {
   const anyPanelOpen = showBrief || showAI || showSearch || showSettings || showDatePicker;
   // Note: expandBar/collapseBar are now no-ops on the backend side since
   // the window is permanently 640px tall. Panels float above the bar via CSS.
+
+  // Windows: shrink the click-through interactive zone to bar-only (200px) when no panels
+  // are open so the terminal and other apps remain clickable above the bar.
+  useEffect(() => {
+    setInteractiveZone(anyPanelOpen ? 700 : 200).catch(() => {});
+  }, [anyPanelOpen]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

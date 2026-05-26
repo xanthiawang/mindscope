@@ -80,44 +80,26 @@ fn is_recording(state: State<'_, ManagedState>) -> bool {
 
 #[tauri::command]
 fn resize_to_bar(app: tauri::AppHandle) {
-    // Window is always 640px tall; just reassert bar mode window level + behavior
     if let Some(window) = app.get_webview_window("main") {
+        // On Windows: re-cover the full screen so bar CSS bottom-positioning works correctly.
+        // On macOS: window stays at the macOS-native tall size; no resize needed.
+        #[cfg(target_os = "windows")]
+        {
+            let screen = get_main_screen();
+            let _ = window.set_size(tauri::PhysicalSize::new(screen.frame_w as u32, screen.frame_h as u32));
+            let _ = window.set_position(tauri::PhysicalPosition::new(screen.frame_x as i32, screen.frame_y as i32));
+        }
         let _ = window.set_always_on_top(true);
         panel::configure_bar_mode(&window);
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ScreenInfo {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    scale: f64,
-    is_main: bool,
-    mouse: bool,
-    frame_x: f64,
-    frame_y: f64,
-    frame_w: f64,
-    frame_h: f64,
-}
+// Re-export ScreenInfo from platform module for use here
+use capture::platform::ScreenInfo;
 
-/// Get all screens info using compiled Swift helper (JSON output)
+/// Get all screens info using platform-specific implementation
 fn get_all_screens() -> Vec<ScreenInfo> {
-    use std::process::Command;
-    let helper = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("bin").join("screen_info");
-    if helper.exists() {
-        if let Ok(out) = Command::new(helper.to_str().unwrap()).output() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Ok(screens) = serde_json::from_str::<Vec<ScreenInfo>>(&s) {
-                if !screens.is_empty() {
-                    return screens;
-                }
-            }
-        }
-    }
-    // Fallback: single screen
-    vec![ScreenInfo { x: 0.0, y: 34.0, w: 1440.0, h: 866.0, scale: 2.0, is_main: true, mouse: true, frame_x: 0.0, frame_y: 0.0, frame_w: 1440.0, frame_h: 900.0 }]
+    capture::platform::get_all_screens()
 }
 
 /// Get the active screen (where mouse is, or main screen as fallback)
@@ -139,9 +121,16 @@ fn get_main_screen() -> ScreenInfo {
 fn resize_to_fullscreen(app: tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let screen = get_main_screen();
-        // Resize to full screen for rewind mode
-        let _ = window.set_size(tauri::LogicalSize::new(screen.frame_w, screen.frame_h));
-        let _ = window.set_position(tauri::LogicalPosition::new(screen.frame_x, screen.frame_y));
+        #[cfg(target_os = "windows")]
+        {
+            let _ = window.set_size(tauri::PhysicalSize::new(screen.frame_w as u32, screen.frame_h as u32));
+            let _ = window.set_position(tauri::PhysicalPosition::new(screen.frame_x as i32, screen.frame_y as i32));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window.set_size(tauri::LogicalSize::new(screen.frame_w, screen.frame_h));
+            let _ = window.set_position(tauri::LogicalPosition::new(screen.frame_x, screen.frame_y));
+        }
         let _ = window.set_always_on_top(false);
         panel::configure_fullscreen_mode(&window);
         let _ = window.set_focus();
@@ -209,6 +198,14 @@ fn set_clickthrough(app: tauri::AppHandle, enabled: bool) {
     }
 }
 
+/// Adjust the Windows click-through interactive zone height (physical px from screen bottom).
+/// Frontend calls with 200 (bar-only) or 700 (panels open) so the terminal stays clickable
+/// except when the cursor is actually over MindScope UI.
+#[tauri::command]
+fn set_interactive_zone(px: i32) {
+    panel::set_interactive_zone(px);
+}
+
 /// Set window to bar mode (floating level, collection behavior)
 #[tauri::command]
 fn set_bar_mode(app: tauri::AppHandle) {
@@ -271,8 +268,8 @@ fn stop_audio(state: State<'_, ManagedState>) {
     let state = state.lock().unwrap();
     capture::recorder::log_meeting_event("stop_audio ENTRY", capture::recorder::get_meeting_state().0);
     state.audio_recorder.stop();
-    // Kill any ffmpeg child processes
-    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+    // Kill any ffmpeg child processes using platform-specific method
+    capture::platform::kill_audio_processes();
     // Prevent auto-restart during current meeting
     capture::recorder::suppress_auto_audio();
     // End the session
@@ -295,7 +292,7 @@ fn toggle_audio(state: State<'_, ManagedState>) -> bool {
     if any_recording {
         capture::recorder::log_meeting_event("toggle_audio branch=STOP", true);
         state.audio_recorder.stop();
-        let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+        capture::platform::kill_audio_processes();
         capture::recorder::suppress_auto_audio();
         capture::recorder::end_audio_session();
         // Clear the manual meeting state so the Transcript tab stops showing
@@ -329,11 +326,7 @@ fn is_audio_recording(state: State<'_, ManagedState>) -> bool {
 
 /// Check if ffmpeg is currently capturing audio
 fn is_ffmpeg_recording() -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-f", "ffmpeg.*avfoundation"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    capture::platform::is_ffmpeg_recording()
 }
 
 /// Get meeting state: { active, app_name, recording }
@@ -458,10 +451,12 @@ async fn ask_ai(prompt: String) -> Result<String, String> {
         prompt.clone()
     };
 
-    let result = Command::new("/opt/homebrew/bin/claude")
+    let claude_path = capture::platform::find_claude_cli()
+        .unwrap_or_else(|| "claude".to_string());
+
+    let result = Command::new(&claude_path)
         .args(["-p", &enriched_prompt])
         .current_dir(&cwd)
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output();
 
     match result {
@@ -723,10 +718,24 @@ pub fn run() {
             // This matches the stable backup version that worked correctly.
             if let Some(window) = app.get_webview_window("main") {
                 let screen = get_main_screen();
-                let _ = window.set_size(tauri::LogicalSize::new(screen.frame_w, screen.frame_h));
-                let _ = window.set_position(tauri::LogicalPosition::new(screen.frame_x, screen.frame_y));
+                // frame_w/h are physical pixels from GetMonitorInfoW.
+                // On Windows we must use PhysicalSize so Tauri doesn't multiply by DPI scale again.
+                // On macOS, AppKit already returns logical points so LogicalSize is correct.
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = window.set_size(tauri::PhysicalSize::new(screen.frame_w as u32, screen.frame_h as u32));
+                    let _ = window.set_position(tauri::PhysicalPosition::new(screen.frame_x as i32, screen.frame_y as i32));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = window.set_size(tauri::LogicalSize::new(screen.frame_w, screen.frame_h));
+                    let _ = window.set_position(tauri::LogicalPosition::new(screen.frame_x, screen.frame_y));
+                }
                 panel::configure_bar_mode(&window);
                 let _ = window.hide();
+                // Windows: start polling thread that manages click-through based on cursor position.
+                // macOS uses JS onMouseEnter/onMouseLeave instead.
+                panel::start_clickthrough_poll(window);
             }
 
             // Tray icon — click toggles bar
@@ -742,9 +751,10 @@ pub fn run() {
                             } else {
                                 let _ = w.show();
                                 let _ = w.set_focus();
-                                // Default to catching clicks so bar receives interaction;
-                                // the bar's onMouseLeave enables click-through when the
-                                // cursor leaves the bar area.
+                                // macOS: disable click-through immediately so the bar is interactive.
+                                // Windows: polling thread manages click-through based on cursor position —
+                                // forcing it off here would freeze mouse input across the whole screen.
+                                #[cfg(not(target_os = "windows"))]
                                 panel::set_clickthrough(&w, false);
                             }
                         }
@@ -765,6 +775,7 @@ pub fn run() {
                         } else {
                             let _ = w.show();
                             let _ = w.set_focus();
+                            #[cfg(not(target_os = "windows"))]
                             panel::set_clickthrough(&w, false);
                             panel::configure_bar_mode(&w);
                         }
@@ -811,6 +822,7 @@ pub fn run() {
             expand_bar,
             collapse_bar,
             set_clickthrough,
+            set_interactive_zone,
             set_bar_mode,
             set_fullscreen_mode,
             is_whisper_available,

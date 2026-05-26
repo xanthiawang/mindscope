@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::platform;
 
 static PERMISSION_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
@@ -11,21 +12,29 @@ pub fn mark_permission_granted() {
 }
 
 pub fn check_screen_permission() -> bool {
-    PERMISSION_CONFIRMED.load(Ordering::Relaxed)
+    // On Windows, screen recording doesn't require explicit permission
+    #[cfg(target_os = "windows")]
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        PERMISSION_CONFIRMED.load(Ordering::Relaxed)
+    }
 }
 
 pub fn has_screen_permission() -> bool {
-    PERMISSION_CONFIRMED.load(Ordering::Relaxed)
+    check_screen_permission()
 }
 
 pub fn open_permission_settings() {
-    let _ = Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
-        .spawn();
+    platform::open_permission_settings();
 }
 
-/// Get the topmost non-MindScope app window via CGWindowList z-order.
+/// Get the topmost non-MindScope app window.
 /// Returns (app_name, window_title, pid, window_id) or None.
+#[cfg(target_os = "macos")]
 fn get_topmost_app_window() -> Option<(String, String, u32, u32)> {
     let helper = dirs_next::home_dir().unwrap_or_default()
         .join(".mindscope").join("bin").join("topmost_window");
@@ -43,6 +52,16 @@ fn get_topmost_app_window() -> Option<(String, String, u32, u32)> {
     let pid: u32 = parts[2].parse().ok()?;
     let wid: u32 = parts[3].parse().ok()?;
     Some((app, title, pid, wid))
+}
+
+#[cfg(target_os = "windows")]
+fn get_topmost_app_window() -> Option<(String, String, u32, u32)> {
+    let (app, title, _, _) = platform::get_active_window_info();
+    if app == "Unknown" {
+        None
+    } else {
+        Some((app, title, 0, 0))
+    }
 }
 
 /// Capture screenshot — uses CGWindowList z-order (via Swift helper) to find
@@ -109,50 +128,15 @@ pub fn get_active_app_via_zorder() -> Option<(String, String)> {
 
 /// Returns (app_name, window_title, bundle_id, browser_url)
 pub fn get_active_window_info() -> (String, String, String, String) {
-    // Priority 1: Use CGWindowList z-order (excludes MindScope itself)
+    // Priority 1: Use z-order detection (excludes MindScope itself)
     if let Some((app, title)) = get_active_app_via_zorder() {
         if !app.is_empty() && !app.eq_ignore_ascii_case("mindscope") {
             return (app, title, String::new(), String::new());
         }
     }
 
-    // Priority 2: Use compiled Swift helper (NSWorkspace + Accessibility API)
-    // Also caches app icon as PNG in ~/.mindscope/data/icons/
-    let helper = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("bin").join("active_app");
-
-    if helper.exists() {
-        if let Ok(out) = Command::new(helper.to_str().unwrap_or("")).output() {
-            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let parts: Vec<&str> = result.splitn(4, '|').collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && parts[0] != "Unknown" {
-                let bundle_id = parts.get(2).unwrap_or(&"").to_string();
-                let browser_url = parts.get(3).unwrap_or(&"").to_string();
-                return (parts[0].to_string(), parts[1].to_string(), bundle_id, browser_url);
-            }
-        }
-    }
-
-    // Fallback: AppleScript (no bundle_id or browser_url)
-    let script = r#"
-tell application "System Events"
-    set frontApp to name of first application process whose frontmost is true
-    try
-        set frontWindow to name of front window of (first application process whose frontmost is true)
-    on error
-        set frontWindow to ""
-    end try
-    return frontApp & "|" & frontWindow
-end tell
-"#;
-    let output = Command::new("osascript").args(["-e", script]).output().ok();
-    if let Some(out) = output {
-        let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if let Some((app, window)) = result.split_once('|') {
-            return (app.to_string(), window.to_string(), String::new(), String::new());
-        }
-    }
-    ("Unknown".to_string(), String::new(), String::new(), String::new())
+    // Priority 2: Use platform-specific implementation
+    platform::get_active_window_info()
 }
 
 // --- Multi-window capture (ported from Screenpipe) ---

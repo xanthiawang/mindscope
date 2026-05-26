@@ -1,3 +1,4 @@
+pub mod platform;
 pub mod screenshot;
 pub mod ocr;
 pub mod db;

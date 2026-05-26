@@ -8,6 +8,7 @@ use std::fs;
 
 use super::db;
 use super::speaker::SharedSpeakerManager;
+use super::platform;
 
 // Track microphone permission state
 static MIC_PERMISSION_GRANTED: AtomicBool = AtomicBool::new(false);
@@ -20,8 +21,8 @@ pub fn check_mic_permission() -> bool {
     }
 
     // Always return true — let ffmpeg handle the actual permission check.
-    // When ffmpeg tries to access the mic via AVFoundation, macOS will show
-    // the permission dialog if needed. If denied, ffmpeg just fails silently.
+    // On Windows, no explicit permission is needed.
+    // On macOS, ffmpeg via AVFoundation will show the permission dialog if needed.
     MIC_PERMISSION_GRANTED.store(true, Ordering::Relaxed);
     MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
     true
@@ -30,36 +31,42 @@ pub fn check_mic_permission() -> bool {
 /// Request microphone permission — triggers dialog ONCE
 /// Only call this from an explicit user action (button click)
 pub fn request_mic_permission() -> bool {
-    // Use a tiny recording attempt to trigger the permission dialog
     let tmp = std::env::temp_dir().join("mindscope_mic_test.m4a");
-    let tmp_str = tmp.to_str().unwrap_or("/tmp/mindscope_mic_test.m4a");
+    let tmp_str = tmp.to_str().unwrap_or_default();
 
-    // Try ffmpeg first
-    let ffmpeg_paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];
-    let mut granted = false;
-    for ffmpeg in &ffmpeg_paths {
-        if Command::new(ffmpeg).arg("-version").output().is_ok() {
-            let status = Command::new(ffmpeg)
-                .args(["-f", "avfoundation", "-i", ":default", "-t", "0.5", "-y", tmp_str])
-                .stderr(std::process::Stdio::null())
-                .status();
-            granted = status.map(|s| s.success()).unwrap_or(false);
-            break;
+    let ffmpeg = match platform::find_ffmpeg() {
+        Some(f) => f,
+        None => {
+            MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
+            return false;
         }
-    }
+    };
 
-    if !granted {
-        // Fallback: afrecord
-        let status = Command::new("afrecord")
-            .args(["-d", "aac", "-f", "m4af", "-c", "1", "-r", "16000", "-s", "0.5", tmp_str])
-            .status();
-        granted = status.map(|s| s.success()).unwrap_or(false);
-    }
+    let audio_format = platform::get_audio_input_format();
+    let audio_device = get_audio_device_arg();
 
+    let status = Command::new(&ffmpeg)
+        .args(["-f", audio_format, "-i", &audio_device, "-t", "0.5", "-y", tmp_str])
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let granted = status.map(|s| s.success()).unwrap_or(false);
     let _ = fs::remove_file(&tmp);
+
     MIC_PERMISSION_GRANTED.store(granted, Ordering::Relaxed);
     MIC_PERMISSION_CHECKED.store(true, Ordering::Relaxed);
     granted
+}
+
+/// Get the audio device argument for ffmpeg based on platform
+#[cfg(target_os = "macos")]
+fn get_audio_device_arg() -> String {
+    ":default".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn get_audio_device_arg() -> String {
+    format!("audio={}", platform::get_default_audio_device())
 }
 
 /// Audio recorder — only starts on explicit user action
@@ -93,11 +100,17 @@ impl AudioRecorder {
         thread::spawn(move || {
             log::info!("MindScope streaming audio recorder started");
 
-            // Find ffmpeg
-            let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]
-                .iter().find(|p| std::path::Path::new(p).exists() || **p == "ffmpeg")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "ffmpeg".to_string());
+            // Find ffmpeg using platform-specific lookup
+            let ffmpeg = match platform::find_ffmpeg() {
+                Some(f) => f,
+                None => {
+                    log::error!("MindScope: ffmpeg not found");
+                    return;
+                }
+            };
+
+            let audio_format = platform::get_audio_input_format();
+            let audio_device = get_audio_device_arg();
 
             // Batch settings: 2s chunks for Whisper context, fed every 2s
             // (Whisper base needs >=1s for decent accuracy; 2s is the sweet spot)
@@ -113,8 +126,8 @@ impl AudioRecorder {
                 // Spawn ffmpeg with raw PCM output to stdout
                 let mut child = match std::process::Command::new(&ffmpeg)
                     .args([
-                        "-f", "avfoundation",
-                        "-i", ":default",
+                        "-f", audio_format,
+                        "-i", &audio_device,
                         "-ac", "1",
                         "-ar", "16000",
                         "-f", "s16le",       // raw signed 16-bit PCM
@@ -225,8 +238,7 @@ impl AudioRecorder {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        let _ = Command::new("pkill").args(["-f", "afrecord"]).status();
-        let _ = Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
+        platform::kill_audio_processes();
     }
 
     pub fn is_running(&self) -> bool {
@@ -242,54 +254,52 @@ impl AudioRecorder {
 fn record_chunk(output_path: &Path, duration_secs: u64) -> bool {
     let path_str = output_path.to_str().unwrap_or("");
 
-    // Try ffmpeg first (most reliable, widely available via homebrew)
-    let ffmpeg_paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];
-    for ffmpeg in &ffmpeg_paths {
-        if Command::new(ffmpeg).arg("-version").output().is_ok() {
-            let status = Command::new(ffmpeg)
-                .args([
-                    "-f", "avfoundation",
-                    "-i", ":default",          // default audio input device
-                    "-t", &duration_secs.to_string(),
-                    "-ac", "1",                // mono
-                    "-ar", "16000",            // 16kHz for Whisper
-                    "-c:a", "aac",
-                    "-y",                      // overwrite
-                    path_str,
-                ])
-                .stderr(std::process::Stdio::null())
-                .status();
-            return status.map(|s| s.success()).unwrap_or(false);
-        }
-    }
+    let ffmpeg = match platform::find_ffmpeg() {
+        Some(f) => f,
+        None => return false,
+    };
 
-    // Fallback: afrecord (older macOS)
-    let status = Command::new("afrecord")
-        .args(["-d", "aac", "-f", "m4af", "-c", "1", "-r", "16000", "-s", &duration_secs.to_string(), path_str])
+    let audio_format = platform::get_audio_input_format();
+    let audio_device = get_audio_device_arg();
+
+    let status = Command::new(&ffmpeg)
+        .args([
+            "-f", audio_format,
+            "-i", &audio_device,
+            "-t", &duration_secs.to_string(),
+            "-ac", "1",                // mono
+            "-ar", "16000",            // 16kHz for Whisper
+            "-c:a", "aac",
+            "-y",                      // overwrite
+            path_str,
+        ])
+        .stderr(std::process::Stdio::null())
         .status();
+
     status.map(|s| s.success()).unwrap_or(false)
 }
 
-/// Transcribe audio — uses Whisper if model available, falls back to macOS SFSpeech
+/// Transcribe audio — uses Whisper if model available, falls back to platform speech API
 pub fn transcribe_audio(audio_path: &Path) -> String {
     let settings = super::settings::load_settings();
     let use_whisper = settings.transcription_engine.as_deref() != Some("system");
 
-    // Try Whisper first (best accuracy)
+    // Try Whisper first (best accuracy, cross-platform)
     if use_whisper && super::whisper::is_model_available() {
         match super::whisper::transcribe(audio_path) {
             Ok(text) if !text.is_empty() => return text,
             Ok(_) => {} // empty = silence, fall through
-            Err(e) => log::warn!("MindScope: Whisper failed, falling back to SFSpeech: {}", e),
+            Err(e) => log::warn!("MindScope: Whisper failed: {}", e),
         }
     }
 
-    // Fallback: macOS Speech Recognition
-    transcribe_with_sfspeech(audio_path)
+    // Fallback: platform-specific speech recognition
+    transcribe_with_platform_api(audio_path)
 }
 
-/// Transcribe using macOS Speech Recognition (compiled helper to avoid swift -e)
-fn transcribe_with_sfspeech(audio_path: &Path) -> String {
+/// Transcribe using platform-specific speech recognition API
+#[cfg(target_os = "macos")]
+fn transcribe_with_platform_api(audio_path: &Path) -> String {
     let helper = ensure_transcribe_helper();
     if !helper.exists() { return String::new(); }
 
@@ -306,7 +316,16 @@ fn transcribe_with_sfspeech(audio_path: &Path) -> String {
     }
 }
 
-/// Compile transcription helper once (avoids swift -e permission issues)
+#[cfg(target_os = "windows")]
+fn transcribe_with_platform_api(_audio_path: &Path) -> String {
+    // Windows speech recognition via SAPI is complex to implement
+    // For now, rely on Whisper for transcription on Windows
+    // Users should download the Whisper model for best results
+    String::new()
+}
+
+/// Compile transcription helper once (macOS only)
+#[cfg(target_os = "macos")]
 fn ensure_transcribe_helper() -> PathBuf {
     let dir = dirs_next::home_dir().unwrap_or_default().join(".mindscope");
     let helper = dir.join("transcribe_helper");
@@ -360,21 +379,10 @@ print(resultText)
 /// Load an audio file as 16kHz mono f32 samples for speaker identification.
 /// Returns None if decoding fails.
 fn load_audio_samples_f32(path: &Path) -> Option<Vec<f32>> {
-    // Decode to WAV using afconvert (macOS built-in), then read with hound
+    // Decode to WAV using platform-specific converter, then read with hound
     let tmp = std::env::temp_dir().join("mindscope_speaker_tmp.wav");
-    let status = Command::new("afconvert")
-        .args([
-            "-f", "WAVE",
-            "-d", "LEI16",
-            "-c", "1",
-            "--sample-rate", "16000",
-            path.to_str().unwrap_or(""),
-            tmp.to_str().unwrap_or(""),
-        ])
-        .status()
-        .ok()?;
 
-    if !status.success() {
+    if platform::convert_audio_to_wav(path, &tmp).is_err() {
         return None;
     }
 
@@ -436,67 +444,25 @@ fn save_audio_segment(date: &str, segment: AudioSegment) {
     }
 }
 
-// --- System audio recording (ported from Screenpipe's ScreenCaptureKit approach) ---
-
-/// Compile the system audio Swift helper once (uses ScreenCaptureKit, macOS 13+).
-/// Returns the path to the compiled binary at ~/.mindscope/bin/system_audio.
-fn ensure_system_audio_helper() -> PathBuf {
-    let bin_dir = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("bin");
-    let helper = bin_dir.join("system_audio");
-
-    if helper.exists() { return helper; }
-
-    // Source is bundled in the swift/ directory next to the binary,
-    // but at dev time it's in src-tauri/swift/
-    let source_candidates = [
-        // Runtime: next to the app binary
-        std::env::current_exe().unwrap_or_default()
-            .parent().unwrap_or(Path::new("."))
-            .join("swift").join("system_audio.swift"),
-        // Dev time: relative to cargo manifest
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("swift").join("system_audio.swift"),
-    ];
-
-    let source = source_candidates.iter().find(|p| p.exists());
-    let Some(source) = source else {
-        log::warn!("MindScope: system_audio.swift not found, system audio capture unavailable");
-        return helper;
-    };
-
-    let _ = fs::create_dir_all(&bin_dir);
-
-    let output = Command::new("swiftc")
-        .args([
-            source.to_str().unwrap(),
-            "-o", helper.to_str().unwrap(),
-            "-O",
-            "-framework", "ScreenCaptureKit",
-            "-framework", "AVFoundation",
-            "-framework", "CoreMedia",
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            log::info!("MindScope: system_audio helper compiled");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            log::warn!("MindScope: failed to compile system_audio helper: {}", stderr);
-        }
-        Err(e) => {
-            log::warn!("MindScope: swiftc not found or failed: {}", e);
-        }
-    }
-
-    helper
-}
+// --- System audio recording ---
 
 /// Record system audio (not microphone) for the given duration.
-/// Uses a compiled Swift helper that leverages ScreenCaptureKit (macOS 13+).
-/// Returns true if recording succeeded and the output file was created.
+/// Uses platform-specific implementation.
+/// macOS: ScreenCaptureKit via Swift helper
+/// Windows: WASAPI loopback via ffmpeg
 pub fn record_system_audio(output_path: &Path, duration_secs: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        record_system_audio_macos(output_path, duration_secs)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        record_system_audio_windows(output_path, duration_secs)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn record_system_audio_macos(output_path: &Path, duration_secs: u64) -> bool {
     let helper = ensure_system_audio_helper();
     if !helper.exists() {
         log::warn!("MindScope: system_audio helper not available");
@@ -521,6 +487,91 @@ pub fn record_system_audio(output_path: &Path, duration_secs: u64) -> bool {
             false
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_system_audio_helper() -> PathBuf {
+    let bin_dir = dirs_next::home_dir().unwrap_or_default()
+        .join(".mindscope").join("bin");
+    let helper = bin_dir.join("system_audio");
+
+    if helper.exists() { return helper; }
+
+    let source_candidates = [
+        std::env::current_exe().unwrap_or_default()
+            .parent().unwrap_or(Path::new("."))
+            .join("swift").join("system_audio.swift"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("swift").join("system_audio.swift"),
+    ];
+
+    let source = source_candidates.iter().find(|p| p.exists());
+    let Some(source) = source else {
+        log::warn!("MindScope: system_audio.swift not found");
+        return helper;
+    };
+
+    let _ = fs::create_dir_all(&bin_dir);
+
+    let output = Command::new("swiftc")
+        .args([
+            source.to_str().unwrap(),
+            "-o", helper.to_str().unwrap(),
+            "-O",
+            "-framework", "ScreenCaptureKit",
+            "-framework", "AVFoundation",
+            "-framework", "CoreMedia",
+        ])
+        .output();
+
+    if let Ok(o) = output {
+        if o.status.success() {
+            log::info!("MindScope: system_audio helper compiled");
+        }
+    }
+
+    helper
+}
+
+#[cfg(target_os = "windows")]
+fn record_system_audio_windows(output_path: &Path, duration_secs: u64) -> bool {
+    // On Windows, use ffmpeg with dshow virtual audio device or WASAPI
+    // This requires a virtual audio device like "Stereo Mix" to be enabled
+    let ffmpeg = match platform::find_ffmpeg() {
+        Some(f) => f,
+        None => {
+            log::warn!("MindScope: ffmpeg not found for system audio");
+            return false;
+        }
+    };
+
+    let path_str = output_path.to_str().unwrap_or("");
+
+    // Try to find a loopback device (Stereo Mix, What U Hear, etc.)
+    let loopback_devices = ["Stereo Mix", "What U Hear", "Wave Out Mix", "Loopback"];
+
+    for device in &loopback_devices {
+        let status = Command::new(&ffmpeg)
+            .args([
+                "-f", "dshow",
+                "-i", &format!("audio={}", device),
+                "-t", &duration_secs.to_string(),
+                "-ac", "1",
+                "-ar", "16000",
+                "-y",
+                path_str,
+            ])
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if let Ok(s) = status {
+            if s.success() && output_path.exists() {
+                return fs::metadata(output_path).map(|m| m.len() > 0).unwrap_or(false);
+            }
+        }
+    }
+
+    log::warn!("MindScope: No system audio loopback device found. Enable 'Stereo Mix' in Windows Sound settings.");
+    false
 }
 
 pub fn load_audio_segments(date: &str) -> Vec<AudioSegment> {

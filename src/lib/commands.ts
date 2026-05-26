@@ -103,6 +103,11 @@ export async function collapseBar(): Promise<void> {
 export async function setClickthrough(enabled: boolean): Promise<void> {
   return invoke("set_clickthrough", { enabled });
 }
+// Windows only: adjust interactive zone height (physical px from screen bottom).
+// 200 = bar-only, 700 = panels open.
+export async function setInteractiveZone(px: number): Promise<void> {
+  return invoke("set_interactive_zone", { px });
+}
 export async function setBarMode(): Promise<void> {
   return invoke("set_bar_mode");
 }
