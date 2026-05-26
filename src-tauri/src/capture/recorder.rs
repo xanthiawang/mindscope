@@ -242,6 +242,9 @@ impl Recorder {
                     auto_audio.stop();
                     meeting_audio_active = false;
                     // Also kill any lingering ffmpeg children
+                    #[cfg(target_os = "windows")]
+                    super::platform::kill_audio_processes();
+                    #[cfg(not(target_os = "windows"))]
                     let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg.*avfoundation"]).status();
                 }
 
@@ -425,14 +428,22 @@ pub fn timestamp_now() -> String { chrono_now() }
 /// Get the name of the detected meeting app (e.g. "Zoom", "Tencent Meeting").
 /// Reads the Swift helper output which includes the app name.
 pub fn detect_meeting_app_name() -> Option<String> {
-    let helper = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("bin").join("is_meeting");
-    if !helper.exists() { return None; }
-    let output = std::process::Command::new(helper.to_str().unwrap_or("")).output().ok()?;
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !result.starts_with("MEETING|") { return None; }
-    let parts: Vec<&str> = result.splitn(3, '|').collect();
-    parts.get(1).map(|s| s.to_string())
+    #[cfg(target_os = "windows")]
+    {
+        return super::platform::get_meeting_app_name();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let helper = dirs_next::home_dir().unwrap_or_default()
+            .join(".mindscope").join("bin").join("is_meeting");
+        if !helper.exists() { return None; }
+        let output = std::process::Command::new(helper.to_str().unwrap_or("")).output().ok()?;
+        let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !result.starts_with("MEETING|") { return None; }
+        let parts: Vec<&str> = result.splitn(3, '|').collect();
+        parts.get(1).map(|s| s.to_string())
+    }
 }
 
 /// Smart meeting detection using compiled Swift helper.
@@ -440,21 +451,30 @@ pub fn detect_meeting_app_name() -> Option<String> {
 /// Returns: "MEETING|name|bundle" if in call, "APP_OPEN|..." if app open but not calling,
 ///          "MIC_ACTIVE" if mic in use by unknown app, "NONE" if idle.
 fn is_meeting_active() -> (bool, String) {
-    let helper = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("bin").join("is_meeting");
-    if !helper.exists() { return (false, String::new()); }
-
-    if let Ok(output) = std::process::Command::new(helper.to_str().unwrap_or(""))
-        .output()
+    #[cfg(target_os = "windows")]
     {
-        let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if result.starts_with("MEETING|") {
-            let parts: Vec<&str> = result.splitn(3, '|').collect();
-            let app_name = parts.get(1).unwrap_or(&"Meeting").to_string();
-            return (true, app_name);
-        }
+        let name = super::platform::get_meeting_app_name();
+        return (name.is_some(), name.unwrap_or_default());
     }
-    (false, String::new())
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let helper = dirs_next::home_dir().unwrap_or_default()
+            .join(".mindscope").join("bin").join("is_meeting");
+        if !helper.exists() { return (false, String::new()); }
+
+        if let Ok(output) = std::process::Command::new(helper.to_str().unwrap_or(""))
+            .output()
+        {
+            let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if result.starts_with("MEETING|") {
+                let parts: Vec<&str> = result.splitn(3, '|').collect();
+                let app_name = parts.get(1).unwrap_or(&"Meeting").to_string();
+                return (true, app_name);
+            }
+        }
+        (false, String::new())
+    }
 }
 
 // Keep backwards compat
@@ -464,6 +484,7 @@ fn is_meeting_process_running() -> bool {
 
 /// Check if a meeting is actively in progress
 /// Uses window title scanning — Zoom shows "Zoom Meeting" window only during calls
+#[cfg(target_os = "macos")]
 fn is_meeting_running(_meeting_apps: &[&str]) -> bool {
     // Fast check: use lsappinfo to get window list (faster than AppleScript)
     let output = std::process::Command::new("osascript")
