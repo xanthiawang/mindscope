@@ -694,29 +694,29 @@ fn recent_app_summary(hours: u64) -> String {
         .join(", ")
 }
 
+fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Call Claude CLI with a prompt. Runs inside the MindScope vault so Claude
 /// picks up the bundled CLAUDE.md + .claude/skills/ from synapse bootstrap.
 /// Routes through Haiku — vault_sync is background summarization, not reasoning.
 fn call_claude(prompt: &str) -> Option<String> {
     let vault = dirs_next::home_dir()?.join(".mindscope").join("vault");
-    let cwd = if vault.exists() {
-        vault
-    } else {
-        dirs_next::home_dir()?
-    };
-    let output = std::process::Command::new("/opt/homebrew/bin/claude")
+    let cwd = if vault.exists() { vault } else { dirs_next::home_dir()? };
+
+    let claude_path = super::platform::find_claude_cli()
+        .unwrap_or_else(|| "claude".to_string());
+
+    let output = std::process::Command::new(&claude_path)
         .args(["-p", prompt, "--model", "claude-haiku-4-5"])
         .current_dir(&cwd)
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .output()
         .ok()?;
+
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !text.is_empty() {
-            Some(text)
-        } else {
-            None
-        }
+        if text.is_empty() { None } else { Some(normalize_line_endings(&text)) }
     } else {
         None
     }
@@ -730,5 +730,25 @@ trait FrameIdle {
 impl FrameIdle for db::FrameRow {
     fn is_idle(&self) -> bool {
         self.app_name == "idle" || self.app_name.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_line_endings;
+
+    #[test]
+    fn test_normalize_crlf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn test_normalize_lf_unchanged() {
+        assert_eq!(normalize_line_endings("a\nb\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn test_normalize_mixed() {
+        assert_eq!(normalize_line_endings("a\r\nb\nc\r\n"), "a\nb\nc\n");
     }
 }
