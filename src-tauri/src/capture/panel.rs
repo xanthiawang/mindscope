@@ -56,6 +56,18 @@ pub fn set_interactive_zone(px: i32) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_interactive_zone(_px: i32) {}
 
+/// Returns the Windows taskbar height plus an 8px gap, for bar positioning.
+/// On non-Windows platforms returns 58 (the macOS Dock safe area).
+#[cfg(target_os = "windows")]
+pub fn get_taskbar_height() -> u32 {
+    super::platform::get_taskbar_height()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_taskbar_height() -> u32 {
+    58
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use windows::Win32::Foundation::*;

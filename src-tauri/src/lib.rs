@@ -206,6 +206,11 @@ fn set_interactive_zone(px: i32) {
     panel::set_interactive_zone(px);
 }
 
+#[tauri::command]
+fn get_taskbar_height() -> u32 {
+    panel::get_taskbar_height()
+}
+
 /// Set window to bar mode (floating level, collection behavior)
 #[tauri::command]
 fn set_bar_mode(app: tauri::AppHandle) {
@@ -823,6 +828,7 @@ pub fn run() {
             collapse_bar,
             set_clickthrough,
             set_interactive_zone,
+            get_taskbar_height,
             set_bar_mode,
             set_fullscreen_mode,
             is_whisper_available,
