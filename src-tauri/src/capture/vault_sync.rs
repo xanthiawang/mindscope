@@ -708,11 +708,12 @@ fn call_claude(prompt: &str) -> Option<String> {
     let claude_path = super::platform::find_claude_cli()
         .unwrap_or_else(|| "claude".to_string());
 
-    let output = std::process::Command::new(&claude_path)
-        .args(["-p", prompt, "--model", "claude-haiku-4-5"])
-        .current_dir(&cwd)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(&claude_path);
+    cmd.args(["-p", prompt, "--model", "claude-haiku-4-5"])
+       .current_dir(&cwd);
+    #[cfg(not(target_os = "windows"))]
+    cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    let output = cmd.output().ok()?;
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -750,5 +751,10 @@ mod tests {
     #[test]
     fn test_normalize_mixed() {
         assert_eq!(normalize_line_endings("a\r\nb\nc\r\n"), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn test_normalize_bare_cr() {
+        assert_eq!(normalize_line_endings("a\rb\rc"), "a\nb\nc");
     }
 }
