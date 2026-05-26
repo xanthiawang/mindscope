@@ -108,6 +108,9 @@ export async function setClickthrough(enabled: boolean): Promise<void> {
 export async function setInteractiveZone(px: number): Promise<void> {
   return invoke("set_interactive_zone", { px });
 }
+export async function getTaskbarHeight(): Promise<number> {
+  return invoke("get_taskbar_height");
+}
 export async function setBarMode(): Promise<void> {
   return invoke("set_bar_mode");
 }

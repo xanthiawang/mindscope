@@ -4,7 +4,7 @@ import SearchPanel from "./components/SearchPanel";
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
 import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough, setInteractiveZone } from "./lib/commands";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough, setInteractiveZone, getTaskbarHeight } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
@@ -60,6 +60,7 @@ type Mode = "bar" | "rewind";
 
 function App() {
   const [mode, setMode] = useState<Mode>("bar");
+  const [barBottom, setBarBottom] = useState(58);
   const [date, setDate] = useState(() => {
     const now = new Date();
     const y = now.getFullYear();
@@ -151,6 +152,10 @@ function App() {
     check();
     const t = setInterval(check, 5000);
     return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    getTaskbarHeight().then(setBarBottom).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -510,7 +515,7 @@ function App() {
     return (
       <div style={{ width: "100vw", height: "100vh", background: "transparent", pointerEvents: "none" }}>
         <div style={{
-          position: "fixed", bottom: 58, left: 20, right: 20, height: 80,
+          position: "fixed", bottom: barBottom, left: 20, right: 20, height: 80,
           background: "rgba(255,255,255,0.92)", backdropFilter: "blur(40px)",
           borderRadius: 20, display: "flex", alignItems: "center", justifyContent: "center", gap: 14,
           boxShadow: "0 4px 24px rgba(0,0,0,0.08), 0 0 0 0.5px rgba(0,0,0,0.06)",
@@ -746,7 +751,7 @@ function App() {
         </div>
 
         {/* Timeline */}
-        <div onClick={(e) => e.stopPropagation()} style={{ position: "absolute", bottom: 58, left: 0, right: 0, padding: "0 50px 16px", zIndex: 20 }}>
+        <div onClick={(e) => e.stopPropagation()} style={{ position: "absolute", bottom: barBottom, left: 0, right: 0, padding: "0 50px 16px", zIndex: 20 }}>
           <BottomTimeline timelineRef={timelineRef} segments={segments} frames={frames} scrubberPos={scrubberPos} onInteraction={handleTimelineInteraction}
             hideInnerTooltip={true}
             onFrameStep={(d) => {
@@ -783,7 +788,7 @@ function App() {
         if (!anyPanelOpen) setClickthrough(true).catch(() => {});
       }}
       style={{
-        position: "fixed", bottom: 58, left: 0, right: 0, height: 70,
+        position: "fixed", bottom: barBottom, left: 0, right: 0, height: 70,
         background: "rgba(255, 255, 255, 0.78)",
         backdropFilter: "blur(40px) saturate(200%)",
         WebkitBackdropFilter: "blur(40px) saturate(200%)",
@@ -974,7 +979,7 @@ function App() {
 
         return (
           <div style={{
-            position: "absolute", bottom: 78, left: 180, width: 340,
+            position: "absolute", bottom: barBottom + 20, left: 180, width: 340,
             background: "rgba(30,30,32,0.95)", backdropFilter: "blur(40px)",
             borderRadius: 16, boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
             overflow: "hidden", zIndex: 100, color: "white",
@@ -1074,7 +1079,7 @@ function App() {
       {/* AI chat panel — floating above the bar (with Chat/Transcript tabs) */}
       {showAI && (
         <div style={{
-          position: "absolute", bottom: 78, right: 0, width: 360, maxHeight: 480,
+          position: "absolute", bottom: barBottom + 20, right: 0, width: 360, maxHeight: 480,
           background: "rgba(255,255,255,0.95)", backdropFilter: "blur(40px)",
           borderRadius: 16, boxShadow: "0 8px 32px rgba(0,0,0,0.12), 0 0 0 0.5px rgba(0,0,0,0.06)",
           display: "flex", flexDirection: "column", overflow: "hidden", zIndex: 100,
@@ -1249,7 +1254,7 @@ function App() {
         const sectionHeaders = ["Focus", "Schedule", "Tasks", "Recent", "People", "Summary", "Highlights", "Notes"];
         return (
           <div style={{
-            position: "absolute", bottom: 78, left: 0, width: 340, maxHeight: 400,
+            position: "absolute", bottom: barBottom + 20, left: 0, width: 340, maxHeight: 400,
             background: "rgba(255,255,255,0.95)", backdropFilter: "blur(40px)",
             borderRadius: 16, boxShadow: "0 8px 32px rgba(0,0,0,0.12), 0 0 0 0.5px rgba(0,0,0,0.06)",
             display: "flex", flexDirection: "column", overflow: "hidden",
