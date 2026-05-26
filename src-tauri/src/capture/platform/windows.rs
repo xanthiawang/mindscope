@@ -435,3 +435,119 @@ pub fn get_default_audio_device() -> String {
         .find(|d| d.to_lowercase().contains("microphone"))
         .unwrap_or_else(|| "Microphone".to_string())
 }
+
+/// Returns the canonical display name for a known meeting process, or None.
+/// Process name comparison is case-insensitive.
+fn known_meeting_process_name(process: &str) -> Option<&'static str> {
+    let p = process.to_lowercase();
+    if p.contains("zoom") { return Some("Zoom"); }
+    if p.contains("teams") || p.contains("ms-teams") { return Some("Microsoft Teams"); }
+    if p.contains("lark") { return Some("Lark"); }
+    if p.contains("dingtalk") { return Some("DingTalk"); }
+    if p.contains("wemeet") { return Some("WeMeet"); }
+    if p.contains("tencentmeeting") { return Some("Tencent Meeting"); }
+    if p.contains("webex") { return Some("Webex"); }
+    if p.contains("discord") { return Some("Discord"); }
+    None
+}
+
+/// Returns the name of the active meeting app (e.g. "Zoom"), or None.
+/// Checks running processes via tasklist; also checks Google Meet via Chrome window title.
+pub fn get_meeting_app_name() -> Option<String> {
+    let output = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut chrome_running = false;
+
+    for line in stdout.lines() {
+        let process = line.split(',').next()?.trim_matches('"');
+        if let Some(name) = known_meeting_process_name(process) {
+            return Some(name.to_string());
+        }
+        if process.to_lowercase().contains("chrome") {
+            chrome_running = true;
+        }
+    }
+
+    // Google Meet runs inside Chrome — detect via foreground window title
+    if chrome_running {
+        let (_, title, _, _) = get_active_window_info();
+        let t = title.to_lowercase();
+        if t.contains("meet") && (t.contains("google") || t.contains("meet.google")) {
+            return Some("Google Meet".to_string());
+        }
+    }
+
+    None
+}
+
+/// Returns true if any known meeting app is currently running.
+pub fn is_meeting_app_running() -> bool {
+    get_meeting_app_name().is_some()
+}
+
+/// Returns the taskbar height in physical pixels plus an 8px gap.
+/// Uses SHAppBarMessage(ABM_GETTASKBARPOS). Returns 48 (safe default) on failure.
+pub fn get_taskbar_height() -> u32 {
+    use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA, ABM_GETTASKBARPOS};
+    use windows::Win32::Foundation::RECT;
+
+    unsafe {
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            hWnd: windows::Win32::Foundation::HWND::default(),
+            uCallbackMessage: 0,
+            uEdge: 0,
+            rc: RECT::default(),
+            lParam: windows::Win32::Foundation::LPARAM(0),
+        };
+        SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd);
+        let rect = abd.rc;
+        let height = (rect.bottom - rect.top).max(0) as u32;
+        if height == 0 { 48 } else { height + 8 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_meeting_process_name;
+
+    #[test]
+    fn test_known_meeting_process_zoom() {
+        assert_eq!(known_meeting_process_name("zoom.exe"), Some("Zoom"));
+        assert_eq!(known_meeting_process_name("Zoom.exe"), Some("Zoom"));
+    }
+
+    #[test]
+    fn test_known_meeting_process_teams() {
+        assert_eq!(known_meeting_process_name("Teams.exe"), Some("Microsoft Teams"));
+        assert_eq!(known_meeting_process_name("ms-teams.exe"), Some("Microsoft Teams"));
+    }
+
+    #[test]
+    fn test_known_meeting_process_others() {
+        assert_eq!(known_meeting_process_name("lark.exe"), Some("Lark"));
+        assert_eq!(known_meeting_process_name("DingTalk.exe"), Some("DingTalk"));
+        assert_eq!(known_meeting_process_name("wemeet.exe"), Some("WeMeet"));
+        assert_eq!(known_meeting_process_name("webex.exe"), Some("Webex"));
+        assert_eq!(known_meeting_process_name("discord.exe"), Some("Discord"));
+    }
+
+    #[test]
+    fn test_known_meeting_process_unknown() {
+        assert_eq!(known_meeting_process_name("notepad.exe"), None);
+        assert_eq!(known_meeting_process_name("chrome.exe"), None);
+        assert_eq!(known_meeting_process_name(""), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_taskbar_height_reasonable() {
+        let h = super::get_taskbar_height();
+        assert!(h >= 32, "taskbar height too small: {}", h);
+        assert!(h <= 200, "taskbar height unreasonably large: {}", h);
+    }
+}
