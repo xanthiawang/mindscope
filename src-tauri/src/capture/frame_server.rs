@@ -30,6 +30,10 @@ static TOKEN: OnceLock<String> = OnceLock::new();
 /// Per-launch random token (64 hex chars).
 pub fn api_token() -> &'static str {
     TOKEN.get_or_init(|| {
+        // Test hook: the launching process may pin the token (it controls our env anyway).
+        if let Ok(t) = std::env::var("MINDSCOPE_API_TOKEN") {
+            if t.len() >= 16 { return t; }
+        }
         let mut bytes = [0u8; 32];
         let ok = std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))

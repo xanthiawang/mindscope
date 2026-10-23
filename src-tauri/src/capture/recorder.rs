@@ -236,6 +236,26 @@ const START_CONFIRM_PROBES: u32 = 2;
 /// Session ends after this long without a positive probe.
 const END_AFTER: Duration = Duration::from_secs(30);
 
+/// What the detector decided for one probe (side effects are applied by `tick`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decision {
+    Nothing,
+    /// Suppression (user pressed stop) can be lifted: the call it belonged to is over.
+    ClearSuppression,
+    /// Start an auto session for this app label.
+    Start(String),
+    /// End the current auto session (reason string for the log).
+    Stop(&'static str),
+}
+
+/// Inputs to one detector step that come from outside the probe.
+#[derive(Debug, Clone, Copy)]
+struct Environment {
+    suppressed: bool,
+    manual_running: bool,
+    meeting_flag_active: bool,
+}
+
 impl MeetingDetector {
     fn new() -> Self {
         Self {
@@ -251,6 +271,34 @@ impl MeetingDetector {
             warned_no_mic: false,
             warned_imprecise: false,
         }
+    }
+
+    /// Pure decision step: feed one probe result at time `now`.
+    fn decide(&mut self, probe: &MeetingProbe, now: Instant, env: Environment, fallback_app: &str) -> Decision {
+        let in_call = probe.in_call;
+        if in_call {
+            self.positives += 1;
+            self.last_positive = Some(now);
+        } else {
+            self.positives = 0;
+        }
+        let call_over = !in_call
+            && self.last_positive.map(|t| now.duration_since(t) >= END_AFTER).unwrap_or(true);
+
+        if self.active {
+            if env.suppressed { return Decision::Stop("auto_stop_user_suppressed"); }
+            if call_over { return Decision::Stop("auto_stop_call_ended"); }
+            return Decision::Nothing;
+        }
+        // Suppression belongs to one call; drop it once that call is clearly over.
+        if env.suppressed && call_over && !env.meeting_flag_active {
+            return Decision::ClearSuppression;
+        }
+        if in_call && self.positives >= START_CONFIRM_PROBES && !env.suppressed && !env.manual_running {
+            let label = if probe.in_call_app.is_empty() { fallback_app.to_string() } else { probe.in_call_app.clone() };
+            return Decision::Start(label);
+        }
+        Decision::Nothing
     }
 
     fn tick(&mut self, settings: &AppSettings, app_name: &str, window_name: &str) {
@@ -275,25 +323,16 @@ impl MeetingDetector {
             log::warn!("MindScope: per-process microphone attribution needs macOS 14+; using device-level mic state (less precise)");
         }
 
-        let in_call = probe.in_call;
-        if in_call {
-            self.positives += 1;
-            self.last_positive = Some(now);
-        } else {
-            self.positives = 0;
-        }
-
-        let suppressed = is_audio_suppressed();
-        let manual_running = manual_audio().is_running();
-        let call_over = !in_call
-            && self.last_positive.map(|t| now.duration_since(t) >= END_AFTER).unwrap_or(true);
-
-        if !self.active {
-            // Suppression belongs to one call; drop it once that call is clearly over.
-            if suppressed && call_over && !MEETING_ACTIVE.load(Ordering::SeqCst) {
-                MEETING_AUDIO_SUPPRESSED.store(false, Ordering::SeqCst);
-            }
-            if in_call && self.positives >= START_CONFIRM_PROBES && !suppressed && !manual_running {
+        let env = Environment {
+            suppressed: is_audio_suppressed(),
+            manual_running: manual_audio().is_running(),
+            meeting_flag_active: MEETING_ACTIVE.load(Ordering::SeqCst),
+        };
+        match self.decide(&probe, now, env, app_name) {
+            Decision::Nothing => {}
+            Decision::ClearSuppression => MEETING_AUDIO_SUPPRESSED.store(false, Ordering::SeqCst),
+            Decision::Stop(reason) => self.finish(reason),
+            Decision::Start(label) => {
                 if !settings.capture_audio { return; }
                 if !permissions::mic_granted() {
                     if !self.warned_no_mic {
@@ -302,7 +341,6 @@ impl MeetingDetector {
                     }
                     return;
                 }
-                let label = if probe.in_call_app.is_empty() { app_name.to_string() } else { probe.in_call_app.clone() };
                 start_audio_session(&label);
                 match auto_audio().start() {
                     Ok(()) => {
@@ -319,11 +357,6 @@ impl MeetingDetector {
                     }
                 }
             }
-        } else if suppressed {
-            // User pressed stop during the call: end this auto session now.
-            self.finish("auto_stop_user_suppressed");
-        } else if call_over {
-            self.finish("auto_stop_call_ended");
         }
     }
 
@@ -473,12 +506,34 @@ fn run_capture_loop(running: &AtomicBool) {
     log::info!("MindScope recorder started (interval={}s, height={}px)",
         app_settings.capture_interval_secs, app_settings.capture_height);
 
+    // Runs EVERY iteration (also when the frame is deduplicated away): write
+    // buffered rows once they are old enough and re-point encoded frames at
+    // video://. Doing this only on the kept-frame path left rows unflushed and
+    // pointing at JPEGs the encoder had already deleted whenever the screen
+    // stayed static.
+    let housekeeping = |frame_buffer: &db::FrameBuffer| {
+        if let Err(e) = frame_buffer.maybe_flush() {
+            log::error!("MindScope: frame buffer flush failed: {}", e);
+        }
+        for enc in video::drain_encoder_output() {
+            let video_ref = format!("video://{}#{}", enc.segment, enc.frame);
+            if enc.ts > 0 {
+                if !frame_buffer.update_path_by_ts(enc.ts, &video_ref) {
+                    let _ = db::update_frame_path_by_timestamp(enc.ts, &video_ref);
+                }
+            } else {
+                let _ = db::update_latest_frame_path(&video_ref);
+            }
+        }
+    };
+
     while running.load(Ordering::SeqCst) {
         if settings_loaded.elapsed() >= Duration::from_secs(10) {
             app_settings = settings::load_settings();
             settings_loaded = Instant::now();
         }
         let interval = Duration::from_secs(app_settings.capture_interval_secs.clamp(1, 120));
+        housekeeping(&frame_buffer);
 
         // Real permission state, no heuristics.
         if !permissions::screen_capture_granted() {
@@ -587,22 +642,7 @@ fn run_capture_loop(running: &AtomicBool) {
         if encoder_started {
             video::encode_frame(&image_path, ts_micros);
         }
-
-        if let Err(e) = frame_buffer.maybe_flush() {
-            log::error!("MindScope: frame buffer flush failed: {}", e);
-        }
-
-        // Encoder confirmations: re-point exactly the encoded frame at video://
-        for enc in video::drain_encoder_output() {
-            let video_ref = format!("video://{}#{}", enc.segment, enc.frame);
-            if enc.ts > 0 {
-                if !frame_buffer.update_path_by_ts(enc.ts, &video_ref) {
-                    let _ = db::update_frame_path_by_timestamp(enc.ts, &video_ref);
-                }
-            } else {
-                let _ = db::update_latest_frame_path(&video_ref);
-            }
-        }
+        housekeeping(&frame_buffer);
 
         frames_kept += 1;
         if frames_kept % 50 == 0 {
@@ -612,13 +652,15 @@ fn run_capture_loop(running: &AtomicBool) {
         sleep_interval(running, interval);
     }
 
-    if let Err(e) = frame_buffer.flush_frames() {
-        log::error!("MindScope: final frame buffer flush failed: {}", e);
-    }
     if detector.active {
         detector.finish("recorder_stopped");
     }
     video::stop_encoder();
+    // Encoder has finalised: apply its last confirmations, then write everything.
+    housekeeping(&frame_buffer);
+    if let Err(e) = frame_buffer.flush_frames() {
+        log::error!("MindScope: final frame buffer flush failed: {}", e);
+    }
     log::info!("MindScope recorder stopped");
 }
 
@@ -705,5 +747,86 @@ fn generate_meeting_vault(start_ts: i64, end_ts: i64, app_name: &str, window_nam
     match std::fs::write(&filepath, &content) {
         Ok(_) => log::info!("MindScope: Vault meeting notes saved to {:?}", filepath),
         Err(e) => log::error!("MindScope: Failed to write vault notes: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(in_call: bool) -> MeetingProbe {
+        MeetingProbe { in_call, in_call_app: if in_call { "Zoom".into() } else { String::new() }, mic_precise: true, mic_active: in_call, ..Default::default() }
+    }
+    const ENV: Environment = Environment { suppressed: false, manual_running: false, meeting_flag_active: false };
+
+    #[test]
+    fn needs_two_positive_probes_to_start_and_30s_silence_to_stop() {
+        let mut d = MeetingDetector::new();
+        let t0 = Instant::now();
+        assert_eq!(d.decide(&probe(true), t0, ENV, "Safari"), Decision::Nothing);
+        assert_eq!(d.decide(&probe(true), t0 + Duration::from_secs(6), ENV, "Safari"), Decision::Start("Zoom".into()));
+        d.active = true;
+        // A single negative probe does not end the session...
+        assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(12), ENV, "Safari"), Decision::Nothing);
+        // ...nor does one at 29 s after the last positive...
+        assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(6 + 29), ENV, "Safari"), Decision::Nothing);
+        // ...but 30 s without evidence ends it (previously unreachable).
+        assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(6 + 30), ENV, "Safari"), Decision::Stop("auto_stop_call_ended"));
+    }
+
+    #[test]
+    fn idle_meeting_app_without_mic_never_starts() {
+        let mut d = MeetingDetector::new();
+        let t0 = Instant::now();
+        // Helper reports meeting app open but not in a call (no mic use) → in_call=false
+        for i in 0..20 {
+            assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(6 * i), ENV, "Zoom"), Decision::Nothing);
+        }
+    }
+
+    #[test]
+    fn user_stop_ends_session_and_blocks_restart_until_call_over() {
+        let mut d = MeetingDetector::new();
+        let t0 = Instant::now();
+        d.decide(&probe(true), t0, ENV, "x");
+        assert!(matches!(d.decide(&probe(true), t0 + Duration::from_secs(6), ENV, "x"), Decision::Start(_)));
+        d.active = true;
+        let suppressed = Environment { suppressed: true, ..ENV };
+        assert_eq!(d.decide(&probe(true), t0 + Duration::from_secs(12), suppressed, "x"), Decision::Stop("auto_stop_user_suppressed"));
+        d.active = false;
+        // Still in the same call: suppression stays, no restart.
+        assert_eq!(d.decide(&probe(true), t0 + Duration::from_secs(18), suppressed, "x"), Decision::Nothing);
+        assert_eq!(d.decide(&probe(true), t0 + Duration::from_secs(24), suppressed, "x"), Decision::Nothing);
+        // Call ends (30 s without positives) → suppression is lifted for the next call.
+        assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(30), suppressed, "x"), Decision::Nothing);
+        assert_eq!(d.decide(&probe(false), t0 + Duration::from_secs(24 + 30), suppressed, "x"), Decision::ClearSuppression);
+    }
+
+    #[test]
+    fn manual_recording_blocks_auto_start() {
+        let mut d = MeetingDetector::new();
+        let t0 = Instant::now();
+        let env = Environment { manual_running: true, meeting_flag_active: true, ..ENV };
+        d.decide(&probe(true), t0, env, "x");
+        assert_eq!(d.decide(&probe(true), t0 + Duration::from_secs(6), env, "x"), Decision::Nothing);
+    }
+
+    #[test]
+    fn frame_signature_dedups_identical_and_keeps_different_frames() {
+        let mut a = image::RgbImage::new(320, 200);
+        for (x, y, p) in a.enumerate_pixels_mut() {
+            let v = ((x / 20 + y / 20) % 2 * 200) as u8; // checkerboard
+            *p = image::Rgb([v, v, 255 - v]);
+        }
+        let img_a = DynamicImage::ImageRgb8(a.clone());
+        let sig_a = FrameSignature::of(&img_a);
+        // JPEG-like noise: same content, tiny per-pixel perturbation
+        let mut b = a.clone();
+        for (i, p) in b.pixels_mut().enumerate() { if i % 7 == 0 { p.0[0] = p.0[0].saturating_add(2); } }
+        assert!(sig_a.similar_to(&FrameSignature::of(&DynamicImage::ImageRgb8(b))));
+        // Different content: invert the bottom half (new window / scrolled page)
+        let mut c = a.clone();
+        for (_, y, p) in c.enumerate_pixels_mut() { if y > 100 { *p = image::Rgb([255 - p.0[0], 255 - p.0[1], 255 - p.0[2]]); } }
+        assert!(!sig_a.similar_to(&FrameSignature::of(&DynamicImage::ImageRgb8(c))));
     }
 }

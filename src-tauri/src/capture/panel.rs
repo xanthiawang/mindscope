@@ -55,8 +55,7 @@ mod macos {
             let current: u64 = msg_send![ns_window, sharingType];
             let log = format!("setSharingType called, now = {}\n", current);
             use std::io::Write;
-            let log_path = dirs_next::home_dir().unwrap_or_default()
-                .join(".mindscope").join("data").join("panel_debug.log");
+            let log_path = crate::capture::paths::data_dir().join("panel_debug.log");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                 let _ = f.write_all(log.as_bytes());
             }
