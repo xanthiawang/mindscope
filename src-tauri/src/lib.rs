@@ -157,6 +157,25 @@ fn synapse_is_syncing() -> bool {
     capture::synapse::is_syncing()
 }
 
+/// Run the deep "dreaming" consolidation pass on demand (merge/dedup/decay the
+/// fact store, re-render cold files, enforce the byte ceiling).
+#[tauri::command]
+async fn synapse_deep_pass() -> Result<(usize, usize, u64), String> {
+    blocking(|| {
+        capture::memory::deep_pass();
+        capture::memory::stats()
+    })
+    .await
+}
+
+/// Forget every fact derived from one source (privacy / correctness).
+/// `source` is a provenance token such as `day:2026-10-23`, `app:Safari`,
+/// `frame:123`, or a prefix like `day:` to forget all days.
+#[tauri::command]
+async fn memory_forget_source(source: String) -> Result<usize, String> {
+    blocking(move || capture::memory::forget_source(&source)).await
+}
+
 /// Hide all UI — background recording/transcription keeps running.
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
@@ -560,11 +579,40 @@ async fn list_projects(state: State<'_, ManagedState>) -> Result<Vec<Project>, S
 
 // ===== App Entry =====
 
+/// Parse `forget --source <token>` (in either order) from the process args.
+/// Returns the source token when the `forget` subcommand is present.
+fn parse_forget_source_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "forget") {
+        return None;
+    }
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--source" || a == "-s" {
+            return it.next().filter(|v| !v.is_empty()).cloned();
+        }
+        if let Some(v) = a.strip_prefix("--source=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Resolve $MINDSCOPE_HOME once (also exported for the Swift helpers).
     let home = paths::mindscope_home();
     let vault_path = paths::vault_dir();
+
+    // CLI: `mindscope forget --source <token>` removes every fact derived from
+    // one source (frame/day/app), then exits without launching the UI.
+    if let Some(src) = parse_forget_source_arg() {
+        let n = capture::memory::forget_source(&src);
+        println!("forgot {} fact(s) derived from source {:?}", n, src);
+        return;
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -717,6 +765,8 @@ pub fn run() {
             quit_app,
             synapse_update,
             synapse_is_syncing,
+            synapse_deep_pass,
+            memory_forget_source,
             expand_bar,
             collapse_bar,
             set_clickthrough,

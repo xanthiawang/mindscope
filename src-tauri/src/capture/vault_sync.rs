@@ -398,6 +398,11 @@ pub fn generate_daily_journal(date: &str) {
 // ─── 3. Update working memory ────────────────────────────────────
 
 /// Update the "Today's Activity" section in _working-memory.md.
+///
+/// Retained for reference / manual use but no longer called by the sync loop:
+/// the Synapse loop and fact store own `## Today's Activity` now (see
+/// `start_vault_sync_loop`).
+#[allow(dead_code)]
 pub fn update_working_memory() {
     let vdir = match vault_dir() {
         Some(d) => d,
@@ -442,92 +447,23 @@ pub fn update_working_memory() {
     }
 }
 
-// ─── 4. Refresh people contacts ──────────────────────────────────
-
-/// Scan today's frames for person names; update "Last contact" in their user.*.md files.
-pub fn refresh_people_contacts() {
-    let vdir = match vault_dir() {
-        Some(d) => d,
-        None => return,
-    };
-
-    let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
-    if frames.is_empty() {
-        return;
-    }
-
-    // Collect all window_name + ocr_text into one searchable string
-    let mut haystack = String::new();
-    for f in &frames {
-        haystack.push_str(&f.window_name);
-        haystack.push(' ');
-        haystack.push_str(&f.ocr_text);
-        haystack.push(' ');
-    }
-    let haystack_lower = haystack.to_lowercase();
-
-    // Scan user.*.md files
-    let pattern = vdir.join("user.*.md").to_string_lossy().to_string();
-    for entry in glob::glob(&pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
-        let path = match entry {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let filename = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        if filename == "user" {
-            continue;
-        }
-
-        // Get person name from frontmatter or filename
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let name = extract_frontmatter_field(&content, "title")
-            .unwrap_or_else(|| filename.strip_prefix("user.").unwrap_or(&filename).replace('-', " "));
-
-        if text::char_len(&name) < 2 {
-            continue;
-        }
-
-        // Check if name appears in today's activity
-        if haystack_lower.contains(&name.to_lowercase()) {
-            update_last_contact(&path, &content, &date);
-        }
-    }
-}
-
-/// Update "Last contact" field in a user markdown file.
-fn update_last_contact(path: &Path, content: &str, date: &str) {
-    // Try to find and replace the "Last contact" line
-    let mut updated = false;
-    let new_content: String = content
-        .lines()
-        .map(|line| {
-            if line.to_lowercase().contains("last contact") && line.contains(':') {
-                updated = true;
-                let (prefix, _) = line.split_once(':').unwrap_or((line, ""));
-                format!("{}: {}", prefix, date)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if updated {
-        if let Err(e) = fs::write(path, &new_content) {
-            log::error!("MindScope vault_sync: failed to update {:?}: {}", path, e);
-        }
-    }
-}
+// ─── 4. (removed) Refresh people contacts ────────────────────────
+//
+// `refresh_people_contacts()` / `update_last_contact()` used to rewrite the
+// "Last contact" line in each `user.*.md`. People facts (and their provenance)
+// now live in the Synapse fact store and the cold files are a rendered view of
+// it, so hand-editing those files from here would fight the store. Removed.
 
 // ─── 5. Background sync loop ────────────────────────────────────
 
 /// Start the vault sync loop in a background thread.
-/// - Every 60 minutes: update_working_memory() + refresh_people_contacts()
 /// - At 23:00: generate_daily_journal(today)
+///
+/// NOTE: this loop no longer runs `update_working_memory()` or
+/// `refresh_people_contacts()`. Those rewrote `## Today's Activity` in
+/// `_working-memory.md` and the `user.*.md` files — sections the Synapse loop
+/// and the fact store now own, so running both fought over the same bytes every
+/// hour. The daily journal (a separate cold artifact) is still generated here.
 pub fn start_vault_sync_loop() {
     if SYNC_RUNNING.swap(true, Ordering::SeqCst) {
         log::warn!("MindScope vault_sync: sync loop already running");
@@ -535,22 +471,11 @@ pub fn start_vault_sync_loop() {
     }
 
     thread::spawn(|| {
-        log::info!("MindScope vault_sync: sync loop started");
-        let mut last_hourly = 0u64;
+        log::info!("MindScope vault_sync: sync loop started (journal-only; Synapse owns working memory + people)");
         let mut journal_done_today = String::new();
 
         loop {
             thread::sleep(Duration::from_secs(60)); // Check every minute
-
-            let now_secs = timeutil::now_secs() as u64;
-
-            // Hourly sync (every 3600 seconds)
-            if now_secs - last_hourly >= 3600 {
-                last_hourly = now_secs;
-                update_working_memory();
-                refresh_people_contacts();
-                log::info!("MindScope vault_sync: hourly sync complete");
-            }
 
             // Journal at 23:00
             let hour = current_hour();
@@ -581,23 +506,6 @@ fn extract_section(content: &str, heading: &str) -> Option<String> {
     } else {
         Some(section)
     }
-}
-
-/// Extract a frontmatter field value
-fn extract_frontmatter_field(content: &str, key: &str) -> Option<String> {
-    if !content.starts_with("---") {
-        return None;
-    }
-    let end = content[3..].find("---")?;
-    let yaml = &content[3..3 + end];
-    for line in yaml.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim() == key {
-                return Some(v.trim().trim_matches('\'').trim_matches('"').to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Compute time spent per app from a list of frames.

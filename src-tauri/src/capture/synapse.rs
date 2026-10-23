@@ -18,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::claude_cli;
+use super::memory;
 use super::paths;
 use super::text;
 use super::util::LockExt;
@@ -183,6 +184,10 @@ pub fn bootstrap() {
         }
     }
 
+    // Import any existing cold vault markdown into the structured fact store
+    // (read-only on disk, once). Safe to call every startup.
+    memory::migrate_if_needed();
+
     log::info!("MindScope synapse: bootstrap complete at {:?}", synapse);
 }
 
@@ -194,6 +199,7 @@ pub fn start_synapse_loop() {
 
     thread::spawn(|| {
         thread::sleep(Duration::from_secs(120));
+        let mut deep_pass_day = String::new();
         loop {
             if has_new_activity() {
                 if let Err(e) = run_synapse_update() {
@@ -201,6 +207,14 @@ pub fn start_synapse_loop() {
                 }
             } else {
                 log::info!("MindScope synapse: no new activity since last pass, skipping");
+            }
+            // Once per local day, run the heavier "dreaming" deep pass: merge /
+            // dedup / decay the fact store, re-render cold files, enforce the
+            // byte ceiling. Only this pass rewrites long-term files.
+            let today = super::timeutil::today();
+            if deep_pass_day != today {
+                deep_pass_day = today;
+                memory::deep_pass();
             }
             thread::sleep(Duration::from_secs(30 * 60));
         }
@@ -244,106 +258,9 @@ pub fn run_synapse_update() -> Result<String, String> {
     result
 }
 
-/// Hard cap for _working-memory.md. If exceeded, auto-trim oldest Today's
-/// Activity rows before asking Claude to do anything.
-const WORKING_MEMORY_HARD_CAP: usize = 4000;
-/// Hard cap for _warm-memory.md.
-const WARM_MEMORY_HARD_CAP: usize = 8000;
-
-/// Pre-flight guard: if _working-memory.md has blown past the hard cap,
-/// brute-force trim the oldest rows in `## Today's Activity` and the oldest
-/// entries in `## Recent People`. This prevents unbounded growth and gives
-/// Claude a sane starting point for its section-scoped edits.
-fn trim_working_memory(path: &Path) {
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if content.chars().count() <= WORKING_MEMORY_HARD_CAP {
-        return;
-    }
-
-    log::warn!(
-        "MindScope synapse: working-memory.md bloated ({} chars), auto-trimming",
-        content.chars().count()
-    );
-
-    // Split into sections by "## " heading. Trim the table rows inside
-    // "Today's Activity" first, then "Recent People" bullets if still over.
-    let mut out = String::with_capacity(content.len());
-    let mut in_activity = false;
-    let mut in_people = false;
-    let mut activity_data_rows = 0usize; // excludes header + separator
-    let mut people_bullets = 0usize;
-
-    for line in content.lines() {
-        if line.starts_with("## ") {
-            in_activity = line.contains("Today's Activity");
-            in_people = line.contains("Recent People");
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-
-        if in_activity && line.trim_start().starts_with('|') && !line.contains("---") {
-            activity_data_rows += 1;
-            // Keep only the 4 most-recent rows (assume chronological; Claude
-            // appends, so "latest" = later in file). We approximate by keeping
-            // the header + sep (first 2 rows) and the last 4 data rows.
-            // Strategy: on first pass just count. Second pass will filter.
-            // Since this is a streaming single-pass, fall back to a simpler
-            // rule: drop data rows until we're under cap.
-            if content.len() > WORKING_MEMORY_HARD_CAP && activity_data_rows > 4 {
-                continue; // skip (drop) this row
-            }
-        }
-
-        if in_people && line.trim_start().starts_with("- ") {
-            people_bullets += 1;
-            if content.len() > WORKING_MEMORY_HARD_CAP + 500 && people_bullets > 3 {
-                continue;
-            }
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // If still over, hard-truncate with a warning marker.
-    if out.chars().count() > WORKING_MEMORY_HARD_CAP + 1000 {
-        let mut truncated: String = out.chars().take(WORKING_MEMORY_HARD_CAP).collect();
-        truncated.push_str("\n\n<!-- synapse: auto-truncated due to size cap -->\n");
-        out = truncated;
-    }
-
-    if let Err(e) = fs::write(path, &out) {
-        log::warn!("MindScope synapse: failed to write trimmed working memory: {}", e);
-    }
-}
-
-/// Pre-flight guard for _warm-memory.md. Simpler: if over cap, truncate
-/// from the bottom preserving the frontmatter + first 4 sections.
-fn trim_warm_memory(path: &Path) {
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if content.chars().count() <= WARM_MEMORY_HARD_CAP {
-        return;
-    }
-
-    log::warn!(
-        "MindScope synapse: warm-memory.md bloated ({} chars), auto-trimming",
-        content.chars().count()
-    );
-
-    let truncated: String = content.chars().take(WARM_MEMORY_HARD_CAP).collect();
-    let marker = "\n\n<!-- synapse: auto-truncated due to size cap -->\n";
-    let final_content = format!("{}{}", truncated, marker);
-    if let Err(e) = fs::write(path, final_content) {
-        log::warn!("MindScope synapse: failed to write trimmed warm memory: {}", e);
-    }
-}
+// Size enforcement now lives in `memory::compress_hot_warm`, which drops whole
+// oldest entries (never cuts mid-item). The 4000/8000-char caps are still named
+// in the prompt below so Claude keeps its output tight.
 
 fn do_synapse_update() -> Result<String, String> {
     let vault = vault_dir();
@@ -355,11 +272,13 @@ fn do_synapse_update() -> Result<String, String> {
         return Err("Claude CLI not found — install `claude` (npm i -g @anthropic-ai/claude-code) or set claude_path in settings.json".into());
     }
 
-    // Pre-flight: enforce hard size caps BEFORE asking Claude to touch anything.
-    trim_working_memory(&vault.join("_working-memory.md"));
-    trim_warm_memory(&vault.join("_warm-memory.md"));
+    // Pre-flight: entry-aware compression (drops whole oldest entries, never
+    // mid-item) BEFORE asking Claude to touch anything.
+    memory::compress_hot_warm(&vault);
 
     let activity = gather_recent_activity();
+    let today = super::timeutil::today();
+    let activity_sources = vec![format!("day:{}", today)];
 
     // Read vault files in Rust so Claude doesn't need Read/Edit tools.
     // This avoids the "400 tool use concurrency" error that occurs when
@@ -392,12 +311,18 @@ fn do_synapse_update() -> Result<String, String> {
          5. Never invent data. If activity is empty/sparse, keep existing content mostly unchanged.\n\
          6. Be concise. Max 80 chars per focus line.\n\
          7. Copy ALL frontmatter (--- block) and structural comments EXACTLY.\n\n\
-         OUTPUT FORMAT — respond with exactly two fenced blocks, nothing else:\n\n\
+         Also extract durable COLD-TIER facts worth remembering about specific \
+         people, projects or meetings seen in the activity (not transient app \
+         usage). Each fact: one atomic statement, a subject name, and kind.\n\n\
+         OUTPUT FORMAT — respond with exactly these fenced blocks, nothing else:\n\n\
          ```working-memory\n\
          (entire updated _working-memory.md content here)\n\
          ```\n\n\
          ```warm-memory\n\
          (entire updated _warm-memory.md content here)\n\
+         ```\n\n\
+         ```facts-json\n\
+         [{{\"kind\":\"person|project|meeting\",\"subject\":\"Name\",\"text\":\"one fact\"}}]\n\
          ```",
         wm_content, warm_content, activity
     );
@@ -408,12 +333,26 @@ fn do_synapse_update() -> Result<String, String> {
     opts.cwd = Some(vault.clone());
     let stdout = claude_cli::run("synapse", &prompt, opts)?;
 
-    // Parse the two fenced blocks and write them back to disk.
+    // Apply only the managed sections (section-scoped splice), preserving
+    // frontmatter, comments, unmanaged sections and the user-owned zone verbatim.
     apply_fenced_output(&vault, &stdout, &wm_content, &warm_content)?;
 
-    // Post-flight: enforce caps again (idempotent safety net).
-    trim_working_memory(&wm_path);
-    trim_warm_memory(&warm_path);
+    // Consolidate extracted cold-tier facts into the structured store
+    // (mem0-style ADD/UPDATE/DELETE/NONE). The markdown cold files are rendered
+    // from the store by the daily deep pass, not here.
+    if let Some(facts_block) = extract_fenced_block(&stdout, "facts-json") {
+        let candidates = memory::parse_candidates_json(&facts_block, &activity_sources);
+        if !candidates.is_empty() {
+            let r = memory::consolidate_candidates(&candidates);
+            log::info!(
+                "MindScope synapse: consolidated {} candidate fact(s) → {} add, {} update, {} delete, {} none",
+                candidates.len(), r.added, r.updated, r.deleted, r.noop
+            );
+        }
+    }
+
+    // Post-flight: entry-aware compression (idempotent safety net).
+    memory::compress_hot_warm(&vault);
     log::info!("MindScope synapse: update complete");
     Ok(stdout)
 }
@@ -439,74 +378,103 @@ fn extract_fenced_block(response: &str, tag: &str) -> Option<String> {
     Some(response[content_start..end].to_string())
 }
 
-/// Parse Claude's fenced-block response and write updated files back to vault.
-/// Validates: USER-OWNED ZONE preserved, size caps respected.
+/// Managed sections per hot/warm file. Only these are overwritten from Claude's
+/// output; everything else (frontmatter, comments, unmanaged sections, the
+/// user-owned zone) is copied from the ORIGINAL verbatim.
+const WM_MANAGED: &[&str] = &["Current Focus", "Today's Activity", "Recent People", "Source Sync Status"];
+const WARM_MANAGED: &[&str] =
+    &["Active Follow-Ups", "Project Momentum", "Collaborator State", "Needs Triage", "Recent Decisions", "Decision Patterns"];
+
+/// Apply Claude's fenced output by SECTION-SCOPED SPLICE rather than whole-file
+/// replacement: for each managed `## Heading`, the original file's body is
+/// replaced with Claude's body for that heading; any heading Claude omitted, and
+/// every unmanaged line, is kept from the original. This makes the edit derive
+/// from per-section decisions and structurally cannot clobber the user zone.
 fn apply_fenced_output(
     vault: &Path,
     response: &str,
     original_wm: &str,
     original_warm: &str,
 ) -> Result<(), String> {
-
-    // Helper: ensure USER-OWNED ZONE content is preserved exactly
-    fn preserve_user_zone(original: &str, updated: &str) -> String {
-        let zone_marker = "## User Notes";
-        let orig_zone = original.find(zone_marker)
-            .map(|pos| &original[pos..]);
-        let updated_zone_pos = updated.find(zone_marker);
-
-        match (orig_zone, updated_zone_pos) {
-            (Some(orig_tail), Some(pos)) => {
-                // Replace whatever Claude wrote below ## User Notes with original
-                format!("{}{}", &updated[..pos], orig_tail)
-            }
-            (Some(orig_tail), None) => {
-                // Claude dropped the zone entirely — append it
-                format!("{}\n\n{}", updated.trim_end(), orig_tail)
-            }
-            _ => updated.to_string(),
-        }
-    }
-
     let mut applied = 0;
 
-    // Process _working-memory.md
     if let Some(new_wm) = extract_fenced_block(response, "working-memory") {
-        let safe_wm = preserve_user_zone(original_wm, &new_wm);
-        if safe_wm.chars().count() <= WORKING_MEMORY_HARD_CAP + 500 {
-            let wm_path = vault.join("_working-memory.md");
-            fs::write(&wm_path, &safe_wm)
-                .map_err(|e| format!("failed to write _working-memory.md: {}", e))?;
-            log::info!("MindScope synapse: updated _working-memory.md ({} → {} chars)",
-                       original_wm.chars().count(), safe_wm.chars().count());
-            applied += 1;
-        } else {
-            log::warn!("MindScope synapse: _working-memory.md update exceeds cap ({}), skipping",
-                       safe_wm.chars().count());
-        }
+        let spliced = splice_managed_sections(original_wm, &new_wm, WM_MANAGED);
+        let path = vault.join("_working-memory.md");
+        fs::write(&path, &spliced).map_err(|e| format!("failed to write _working-memory.md: {}", e))?;
+        log::info!("MindScope synapse: spliced _working-memory.md ({} → {} chars)",
+                   original_wm.chars().count(), spliced.chars().count());
+        applied += 1;
     }
 
-    // Process _warm-memory.md
     if let Some(new_warm) = extract_fenced_block(response, "warm-memory") {
-        let safe_warm = preserve_user_zone(original_warm, &new_warm);
-        if safe_warm.chars().count() <= WARM_MEMORY_HARD_CAP + 500 {
-            let warm_path = vault.join("_warm-memory.md");
-            fs::write(&warm_path, &safe_warm)
-                .map_err(|e| format!("failed to write _warm-memory.md: {}", e))?;
-            log::info!("MindScope synapse: updated _warm-memory.md ({} → {} chars)",
-                       original_warm.chars().count(), safe_warm.chars().count());
-            applied += 1;
-        } else {
-            log::warn!("MindScope synapse: _warm-memory.md update exceeds cap ({}), skipping",
-                       safe_warm.chars().count());
-        }
+        let spliced = splice_managed_sections(original_warm, &new_warm, WARM_MANAGED);
+        let path = vault.join("_warm-memory.md");
+        fs::write(&path, &spliced).map_err(|e| format!("failed to write _warm-memory.md: {}", e))?;
+        log::info!("MindScope synapse: spliced _warm-memory.md ({} → {} chars)",
+                   original_warm.chars().count(), spliced.chars().count());
+        applied += 1;
     }
 
     if applied == 0 {
         log::warn!("MindScope synapse: no fenced blocks found in response, no files updated");
     }
-
     Ok(())
+}
+
+/// The body lines of a `## heading` section in `content` (exclusive of the
+/// heading line, up to the next `## ` or EOF). None if the heading is absent.
+fn section_body(content: &str, heading: &str) -> Option<String> {
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.strip_prefix("## ").map(|h| h.trim() == heading).unwrap_or(false) {
+            let mut body = Vec::new();
+            while let Some(peek) = lines.peek() {
+                if peek.starts_with("## ") {
+                    break;
+                }
+                body.push(*peek);
+                lines.next();
+            }
+            return Some(body.join("\n"));
+        }
+    }
+    None
+}
+
+/// Rebuild `original`, replacing each managed section's body with the body of
+/// the same section from `updated` (when present). All other content is kept
+/// from `original` verbatim.
+fn splice_managed_sections(original: &str, updated: &str, managed: &[&str]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let mut i = 0;
+    while i < orig_lines.len() {
+        let line = orig_lines[i];
+        if let Some(h) = line.strip_prefix("## ") {
+            let h = h.trim();
+            if managed.contains(&h) {
+                if let Some(body) = section_body(updated, h) {
+                    out.push(line.to_string());
+                    let trimmed = body.trim_end_matches('\n');
+                    out.push(trimmed.to_string());
+                    // Skip the original body for this section.
+                    i += 1;
+                    while i < orig_lines.len() && !orig_lines[i].starts_with("## ") {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    let mut result = out.join("\n");
+    if original.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn gather_recent_activity() -> String {
@@ -566,4 +534,43 @@ fn gather_recent_activity() -> String {
 /// Check if synapse is currently syncing (for UI indicators).
 pub fn is_syncing() -> bool {
     SYNAPSE_IS_SYNCING.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splice_replaces_only_managed_sections() {
+        let original = "---\nid: wm\nupdated: 0\n---\n\n\
+            ## Current Focus\n\n**Primary**: old focus\n\n\
+            ## Unmanaged\n\nkeep me\n\n\
+            ## User Notes\n\n- my private note\n";
+        let updated = "## Current Focus\n\n**Primary**: NEW focus\n\n\
+            ## User Notes\n\n- CLAUDE TRIED TO CLOBBER THIS\n";
+        let out = splice_managed_sections(original, updated, &["Current Focus"]);
+        assert!(out.contains("NEW focus"), "managed section updated");
+        assert!(!out.contains("old focus"));
+        assert!(out.contains("## Unmanaged\n\nkeep me"), "unmanaged section preserved");
+        assert!(out.contains("- my private note"), "user zone preserved");
+        assert!(!out.contains("CLOBBER"), "user zone never taken from Claude output");
+        assert!(out.contains("id: wm"), "frontmatter preserved");
+    }
+
+    #[test]
+    fn splice_keeps_section_when_update_omits_it() {
+        let original = "## Today's Activity\n\n| a |\n\n## Recent People\n\n- Amy\n";
+        let updated = "## Today's Activity\n\n| b |\n"; // no Recent People
+        let out = splice_managed_sections(original, updated, &["Today's Activity", "Recent People"]);
+        assert!(out.contains("| b |"), "present section updated");
+        assert!(out.contains("- Amy"), "omitted section kept from original");
+    }
+
+    #[test]
+    fn section_body_extracts_until_next_heading() {
+        let c = "## A\n\nbody a\nline 2\n\n## B\n\nbody b\n";
+        assert_eq!(section_body(c, "A").unwrap().trim(), "body a\nline 2");
+        assert_eq!(section_body(c, "B").unwrap().trim(), "body b");
+        assert!(section_body(c, "Missing").is_none());
+    }
 }
