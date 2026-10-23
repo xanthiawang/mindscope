@@ -18,6 +18,7 @@ pub mod frame_server;
 pub mod panel;
 pub mod whisper;
 pub mod pipes;
+pub mod memory;
 pub mod vault_sync;
 pub mod synapse;
 pub mod claude_cli;

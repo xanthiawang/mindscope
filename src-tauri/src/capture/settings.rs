@@ -30,12 +30,18 @@ pub struct AppSettings {
     /// Capture height in pixels (the active display is downscaled to this before OCR/encode).
     #[serde(default = "default_capture_height")]
     pub capture_height: u32,
+    /// Hard ceiling (MB) for the Synapse knowledge layer: the fact store db plus
+    /// the rendered vault markdown. 0 = no cap. Independent of storage_budget_mb
+    /// (which bounds the raw data layer under data/).
+    #[serde(default = "default_memory_budget_mb")]
+    pub memory_budget_mb: u64,
 }
 
 fn default_true() -> bool { true }
 fn default_storage_budget_mb() -> u64 { 10 * 1024 }
 fn default_claude_daily_budget() -> u32 { 120 }
 fn default_capture_height() -> u32 { 1080 }
+fn default_memory_budget_mb() -> u64 { 64 }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -53,6 +59,7 @@ impl Default for AppSettings {
             storage_budget_mb: default_storage_budget_mb(),
             claude_daily_budget: default_claude_daily_budget(),
             capture_height: default_capture_height(),
+            memory_budget_mb: default_memory_budget_mb(),
         }
     }
 }
