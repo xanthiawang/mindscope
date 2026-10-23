@@ -155,6 +155,10 @@ pub fn enforce_budget(store: &MemoryStore, vault: &Path, ceiling_bytes: u64, now
 
     let mut iter = 0;
     loop {
+        // Re-sync the vault to the store first: dropped/archived facts leave the
+        // markdown, so the measured total reflects reality (the vault is a view).
+        super::render::render_cold(store, vault);
+        store.vacuum();
         let total = store.disk_bytes() + vault_md_bytes(vault);
         if total <= ceiling_bytes || iter > 10_000 {
             report.over_budget = total > ceiling_bytes;
@@ -166,7 +170,6 @@ pub fn enforce_budget(store: &MemoryStore, vault: &Path, ceiling_bytes: u64, now
         let pruned = store.prune_tombstoned(64);
         if pruned > 0 {
             report.facts_pruned += pruned;
-            store.vacuum();
             continue;
         }
         // Then shed the lowest-value live facts (they prune next iteration).

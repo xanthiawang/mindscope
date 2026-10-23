@@ -346,6 +346,7 @@ impl MemoryStore {
             .unwrap_or(0) as usize
     }
 
+    #[allow(dead_code)] // used by tests / future diagnostics
     pub fn history_count(&self, fact_id: &str) -> usize {
         self.conn
             .query_row("SELECT COUNT(*) FROM fact_history WHERE fact_id = ?1", [fact_id], |r| {
@@ -354,6 +355,7 @@ impl MemoryStore {
             .unwrap_or(0) as usize
     }
 
+    #[allow(dead_code)] // used by tests / future diagnostics
     pub fn total_history_count(&self) -> usize {
         self.conn
             .query_row("SELECT COUNT(*) FROM fact_history", [], |r| r.get::<_, i64>(0))
@@ -607,7 +609,9 @@ impl MemoryStore {
     }
 
     pub fn vacuum(&self) {
-        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+        // VACUUM rewrites the db (and, in WAL mode, the WAL), so checkpoint-
+        // truncate the WAL AFTER it to actually reclaim the on-disk bytes.
+        let _ = self.conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     /// On-disk size of the store (db file + WAL/SHM sidecars). 0 for in-memory.

@@ -89,11 +89,13 @@ fn render_subject(store: &MemoryStore, kind: Kind, subject: &str, facts: &[Fact]
 pub struct RenderReport {
     pub written: usize,
     pub skipped_user_owned: usize,
+    pub pruned: usize,
 }
 
 /// Render every live subject to its cold file, honouring the store-marker
-/// safety rule. Returns how many files were (re)written vs skipped because a
-/// user-authored file of the same name exists without the marker.
+/// safety rule, and prune store-owned cold files whose subject no longer has
+/// any live facts (so the vault is a faithful, bounded view of the store).
+/// Returns how many files were (re)written, skipped (user-authored), or pruned.
 pub fn render_cold(store: &MemoryStore, vault: &Path) -> RenderReport {
     let mut report = RenderReport::default();
     if std::fs::create_dir_all(vault).is_err() {
@@ -107,6 +109,7 @@ pub fn render_cold(store: &MemoryStore, vault: &Path) -> RenderReport {
         }
     }
 
+    let mut live_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (kind, subject) in store.live_subjects() {
         let facts = store.facts_for_subject(&subject);
         if facts.is_empty() {
@@ -121,6 +124,27 @@ pub fn render_cold(store: &MemoryStore, vault: &Path) -> RenderReport {
         let body = render_subject(store, kind, &subject, &facts, archived.get(&subject).copied().unwrap_or(0));
         if std::fs::write(&path, body).is_ok() {
             report.written += 1;
+            live_files.insert(filename);
+        }
+    }
+
+    // Prune store-owned cold files with no live subject left (never user files).
+    if let Ok(rd) = std::fs::read_dir(vault) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_cold = name.starts_with("user.") || name.starts_with("proj.") || name.starts_with("meet.") || name.starts_with("note.");
+            if !is_cold || !name.ends_with(".md") || live_files.contains(&name) {
+                continue;
+            }
+            // Only remove files the store owns (carry the marker).
+            match std::fs::read_to_string(entry.path()) {
+                Ok(c) if c.contains(STORE_MARKER) => {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        report.pruned += 1;
+                    }
+                }
+                _ => {}
+            }
         }
     }
     report

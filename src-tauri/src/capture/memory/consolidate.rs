@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use super::super::claude_cli;
-use super::store::{jaccard, normalize, tokens, Candidate, Fact, Kind, MemoryStore};
+use super::store::{jaccard, normalize, tokens, Candidate, Fact, MemoryStore};
 
 /// The reconciliation verdict for one candidate against the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +234,7 @@ pub struct IngestReport {
 }
 
 impl IngestReport {
+    #[allow(dead_code)] // diagnostic helper
     pub fn total(&self) -> usize {
         self.added + self.updated + self.deleted + self.noop
     }
@@ -275,16 +276,10 @@ pub fn ingest(store: &MemoryStore, candidates: &[Candidate], now: i64, use_claud
     report
 }
 
-/// Convenience used by the live loop: ingest against the default store kind.
-pub fn candidate(kind: Kind, subject: &str, text: &str, sources: &[String]) -> Candidate {
-    let mut c = Candidate::new(kind, subject, text);
-    c.source_refs = sources.to_vec();
-    c
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::store::Kind;
 
     fn mk(text: &str) -> Candidate {
         Candidate::new(Kind::Person, "p", text).with_source("day:2026-10-23")

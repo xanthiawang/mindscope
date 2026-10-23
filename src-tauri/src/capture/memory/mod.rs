@@ -13,6 +13,9 @@ pub mod maintenance;
 pub mod render;
 pub mod store;
 
+#[cfg(test)]
+mod sim_test;
+
 use std::path::Path;
 use std::sync::Mutex;
 
