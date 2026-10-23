@@ -658,7 +658,7 @@ pub fn run() {
             // Cmd+Shift+Space — toggle full overlay
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
             let ah = app.handle().clone();
-            app.global_shortcut().on_shortcut("CmdOrCtrl+Shift+Space", move |_app, _sc, event| {
+            let shortcut = app.global_shortcut().on_shortcut("CmdOrCtrl+Shift+Space", move |_app, _sc, event| {
                 if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
                     if let Some(w) = ah.get_webview_window("main") {
                         if w.is_visible().unwrap_or(false) {
@@ -672,7 +672,11 @@ pub fn run() {
                         }
                     }
                 }
-            })?;
+            });
+            if let Err(e) = shortcut {
+                // Another MindScope instance (or another app) owns the shortcut; keep running.
+                log::warn!("MindScope: could not register Cmd+Shift+Space ({}); use the tray icon", e);
+            }
 
             Ok(())
         })

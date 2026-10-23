@@ -89,7 +89,8 @@ pub fn capture_display(display_id: Option<u32>, max_height: u32) -> Option<Dynam
     let img = DynamicImage::ImageRgba8(rgba);
     let img = if max_height > 0 && h > max_height {
         let new_w = ((w as u64 * max_height as u64) / h as u64).max(1) as u32;
-        img.resize_exact(new_w, max_height, image::imageops::FilterType::Triangle)
+        // Box filter: a few ms for a 5K frame, vs. ~100 ms for a Triangle resize.
+        img.thumbnail_exact(new_w, max_height)
     } else {
         img
     };

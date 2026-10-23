@@ -3,7 +3,7 @@
 Three loops run behind the bar. Everything is local unless you click Ask AI.
 
 ```
-   ① Capture (every 2s)   ② Meeting (on demand)   ③ Memory (every 30m)
+   ① Capture (every 5s)   ② Meeting (on demand)   ③ Memory (every 30m)
           │                       │                        │
           ▼                       ▼                        ▼
    frames + FTS5           audio transcripts          vault markdown
@@ -63,7 +63,7 @@ Daily Brief and Ask AI read from these files. The more you use MindScope, the ri
 
 ### How Synapse avoids memory drift
 
-- **Edit-only, section-scoped**: Claude patches specific `## Headings` via `old_string → new_string`. Never a full rewrite. Your manual notes in `## User Notes` are off-limits.
+- **Tool-free, section-scoped**: MindScope inlines the memory files in the prompt and Claude returns them updated; only the managed `## Headings` may change, and MindScope restores `## User Notes` verbatim before writing. No file tools, no git.
 - **Hard size caps**: a Rust guard auto-trims the oldest Today's Activity rows and Recent People entries before and after every Claude call.
 - **Auto-decay**: unchecked tasks > 14 days drop from Hot → Warm "Needs Triage"; meeting follow-ups > 7 days get tagged Overdue.
 
@@ -120,5 +120,5 @@ Synapse fires 48 times a day. Sonnet would burn through a Pro subscription fast.
 1. Three loops: capture (2s), meeting (on demand), memory (30 min).
 2. Search = FTS5, instant, no AI, no network.
 3. AI runs in exactly 3 places: Synapse loop, meeting notes, Ask AI.
-4. Memory has 3 tiers with hard caps and Edit-only patches — no drift.
+4. Memory has 3 tiers with hard caps and section-scoped, tool-free updates — no drift.
 5. Everything under `~/.mindscope/`. Nothing leaves your Mac unless you click Ask AI.

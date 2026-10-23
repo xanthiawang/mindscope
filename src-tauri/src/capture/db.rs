@@ -122,24 +122,45 @@ pub fn init_db() -> Result<(), String> {
             [], |r| r.get(0),
         )
         .unwrap_or(0);
-    if packed > 0 {
-        log::info!("MindScope: migrating {} packed OCR rows into ocr_regions column", packed);
-        let started = Instant::now();
-        let res = conn.execute_batch("
-            UPDATE frames SET
-                ocr_regions = substr(ocr_text, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) + 15),
-                ocr_text    = substr(ocr_text, 1, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) - 1)
-            WHERE instr(ocr_text, char(10)||'---REGIONS---'||char(10)) > 0;
-        ");
-        match res {
-            Ok(_) => log::info!("MindScope: OCR regions migration done in {:.1}s", started.elapsed().as_secs_f32()),
-            Err(e) => log::warn!("MindScope: OCR regions migration failed: {}", e),
-        }
-    }
 
     *DB.lock_or_recover() = Some(conn);
     log::info!("MindScope: Database initialized at {:?}", path);
+
+    if packed > 0 {
+        // Existing installs can have hundreds of thousands of packed rows; migrate
+        // in batches on a background thread so startup and queries are not blocked.
+        log::info!("MindScope: migrating {} packed OCR rows into ocr_regions column (background)", packed);
+        std::thread::Builder::new()
+            .name("mindscope-db-migrate".into())
+            .spawn(move || migrate_packed_regions(packed))
+            .ok();
+    }
     Ok(())
+}
+
+/// Split legacy "text\n---REGIONS---\njson" rows into ocr_text/ocr_regions, 2000 rows per
+/// transaction, releasing the DB lock between batches.
+fn migrate_packed_regions(total: i64) {
+    let started = Instant::now();
+    let mut done: i64 = 0;
+    loop {
+        let res = with_db(|conn| {
+            conn.execute(
+                "UPDATE frames SET
+                    ocr_regions = substr(ocr_text, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) + 15),
+                    ocr_text    = substr(ocr_text, 1, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) - 1)
+                 WHERE id IN (SELECT id FROM frames
+                              WHERE instr(ocr_text, char(10)||'---REGIONS---'||char(10)) > 0 LIMIT 2000)",
+                [],
+            )
+        });
+        match res {
+            Ok(0) => break,
+            Ok(n) => { done += n as i64; std::thread::sleep(std::time::Duration::from_millis(50)); }
+            Err(e) => { log::warn!("MindScope: OCR regions migration failed after {} rows: {}", done, e); return; }
+        }
+    }
+    log::info!("MindScope: OCR regions migration done ({} of {} rows) in {:.1}s", done, total, started.elapsed().as_secs_f32());
 }
 
 fn with_db<F, T>(f: F) -> Result<T, String>

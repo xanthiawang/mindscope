@@ -401,16 +401,24 @@ pub struct FrameSignature {
 
 impl FrameSignature {
     pub fn of(img: &DynamicImage) -> Self {
-        let small = img.resize_exact(32, 32, image::imageops::FilterType::Triangle).to_luma8();
-        let px: Vec<u8> = small.pixels().map(|p| p.0[0]).collect();
-        let mean = (px.iter().map(|&p| p as u32).sum::<u32>() / px.len().max(1) as u32) as u8;
+        // One 64×64 luma thumbnail (box filter) feeds both the histogram and,
+        // via 2×2 block means, the 32×32 hash.
+        let small = img.thumbnail_exact(64, 64).to_luma8();
+        let mut hist = [0u32; 256];
+        for p in small.pixels() { hist[p.0[0] as usize] += 1; }
+        let mut px = [0u16; 1024];
+        for (i, v) in px.iter_mut().enumerate() {
+            let (bx, by) = ((i % 32) as u32 * 2, (i / 32) as u32 * 2);
+            *v = (small.get_pixel(bx, by).0[0] as u16
+                + small.get_pixel(bx + 1, by).0[0] as u16
+                + small.get_pixel(bx, by + 1).0[0] as u16
+                + small.get_pixel(bx + 1, by + 1).0[0] as u16) / 4;
+        }
+        let mean = (px.iter().map(|&p| p as u32).sum::<u32>() / 1024) as u16;
         let mut hash = [0u64; 16];
         for (i, &p) in px.iter().enumerate() {
             if p > mean { hash[i / 64] |= 1u64 << (i % 64); }
         }
-        let hist_src = img.resize_exact(64, 64, image::imageops::FilterType::Triangle).to_luma8();
-        let mut hist = [0u32; 256];
-        for p in hist_src.pixels() { hist[p.0[0] as usize] += 1; }
         Self { hash, hist }
     }
 
