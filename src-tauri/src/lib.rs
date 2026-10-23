@@ -202,6 +202,12 @@ async fn request_mic_permission() -> Result<bool, String> {
 
 fn start_manual_audio() -> Result<bool, String> {
     recorder::log_meeting_event("start_audio ENTRY", recorder::get_meeting_state().0);
+    // The auto meeting recorder already has the mic: one ffmpeg per mic is enough.
+    if recorder::auto_audio().is_running() {
+        return Ok(true);
+    }
+    // The user asked for recording — undo a previous "stop" so nothing fights it.
+    recorder::clear_audio_suppression();
     // Start a manual session (or piggyback on the auto session if one is active)
     let (existing_id, existing_type) = recorder::get_current_session();
     let session_type = if existing_id.is_empty() {

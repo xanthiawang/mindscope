@@ -51,8 +51,13 @@ static CURRENT_SESSION_TYPE: Mutex<Option<String>> = Mutex::new(None);
 static AUTO_AUDIO: OnceLock<AudioRecorder> = OnceLock::new();
 static MANUAL_AUDIO: OnceLock<AudioRecorder> = OnceLock::new();
 
-pub fn auto_audio() -> &'static AudioRecorder { AUTO_AUDIO.get_or_init(AudioRecorder::new) }
-pub fn manual_audio() -> &'static AudioRecorder { MANUAL_AUDIO.get_or_init(AudioRecorder::new) }
+pub fn auto_audio() -> &'static AudioRecorder { AUTO_AUDIO.get_or_init(|| AudioRecorder::new(audio::RecorderKind::Auto)) }
+pub fn manual_audio() -> &'static AudioRecorder { MANUAL_AUDIO.get_or_init(|| AudioRecorder::new(audio::RecorderKind::Manual)) }
+
+/// The user explicitly asked for recording: lift any "stop" suppression.
+pub fn clear_audio_suppression() {
+    MEETING_AUDIO_SUPPRESSED.store(false, Ordering::SeqCst);
+}
 
 /// Is any audio capture (auto or manual) running?
 pub fn is_any_audio_running() -> bool {

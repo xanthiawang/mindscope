@@ -38,30 +38,44 @@ pub enum StartError {
     FfmpegMissing,
 }
 
+/// Who owns this recorder: the auto meeting detector or the user's mic button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderKind {
+    /// Started by meeting detection; honours the user's "stop" suppression flag.
+    Auto,
+    /// Started by the mic button; ignores suppression (the user asked for it).
+    Manual,
+}
+
 /// Streaming audio recorder (mic → ffmpeg → Whisper).
 pub struct AudioRecorder {
+    kind: RecorderKind,
     running: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
-impl Default for AudioRecorder {
-    fn default() -> Self { Self::new() }
-}
-
 impl AudioRecorder {
-    pub fn new() -> Self {
+    pub fn new(kind: RecorderKind) -> Self {
         Self {
+            kind,
             running: Arc::new(AtomicBool::new(false)),
             child: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Start recording. Returns `Ok(())` when the streaming thread is up.
+    /// A manual start with permission still undetermined triggers the system
+    /// prompt (it is an explicit user action); the auto recorder never prompts.
     pub fn start(&self) -> Result<(), StartError> {
         if self.running.load(Ordering::SeqCst) {
             return Err(StartError::AlreadyRunning);
         }
-        if !check_mic_permission() {
+        let granted = match (self.kind, permissions::mic_status()) {
+            (_, permissions::MicStatus::Authorized) => true,
+            (RecorderKind::Manual, permissions::MicStatus::NotDetermined) => request_mic_permission(),
+            _ => false,
+        };
+        if !granted {
             return Err(StartError::NoPermission);
         }
         let Some(ffmpeg) = tools::find_ffmpeg() else {
@@ -72,10 +86,11 @@ impl AudioRecorder {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let child_slot = self.child.clone();
+        let kind = self.kind;
 
         thread::spawn(move || {
-            log::info!("MindScope streaming audio recorder started ({})", ffmpeg.display());
-            run_stream_loop(&ffmpeg, &running, &child_slot);
+            log::info!("MindScope streaming audio recorder started ({:?}, {})", kind, ffmpeg.display());
+            run_stream_loop(kind, &ffmpeg, &running, &child_slot);
             running.store(false, Ordering::SeqCst);
             super::whisper::unload();
             log::info!("MindScope streaming audio recorder stopped");
@@ -103,7 +118,7 @@ impl AudioRecorder {
     }
 }
 
-fn run_stream_loop(ffmpeg: &PathBuf, running: &AtomicBool, child_slot: &Mutex<Option<Child>>) {
+fn run_stream_loop(kind: RecorderKind, ffmpeg: &PathBuf, running: &AtomicBool, child_slot: &Mutex<Option<Child>>) {
     // 2 s batches for Whisper context, 0.3 s overlap so words split at boundaries are caught.
     const SAMPLE_RATE: u32 = 16_000;
     const BATCH_SECONDS: f32 = 2.0;
@@ -203,7 +218,9 @@ fn run_stream_loop(ffmpeg: &PathBuf, running: &AtomicBool, child_slot: &Mutex<Op
                 last_batch_start = std::time::Instant::now();
             }
 
-            if super::recorder::is_audio_suppressed() { break; }
+            // Only the auto recorder stops on the user's "stop" flag; a manual
+            // recorder breaking here would kill and respawn ffmpeg every 200 ms.
+            if kind == RecorderKind::Auto && super::recorder::is_audio_suppressed() { break; }
 
             // Stalled read: restart ffmpeg
             if last_batch_start.elapsed() > Duration::from_secs(15) { break; }

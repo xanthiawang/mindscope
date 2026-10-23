@@ -49,7 +49,8 @@
       "resources/synapse/**/*"
     ],
     "macOS": {
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "minimumSystemVersion": "11.0"
     },
     "externalBin": [
       "binaries/ocr_helper",
