@@ -3,9 +3,11 @@ import SearchPanel from "./components/SearchPanel";
 // MeetingBar removed — meeting transcript is now integrated into the AI panel
 // import DetailView from "./components/DetailView";
 import SettingsPanel from "./components/SettingsPanel";
-import type { CapturedFrame } from "./lib/types";
-import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getDailyBrief, hideWindow, setClickthrough } from "./lib/commands";
+import type { CapturedFrame, TimelineFrame } from "./lib/types";
+import { checkPermission, openPermissionSettings, startRecording, isRecording, getTimeline, getTimelineSince, getDailyBrief, hideWindow, setClickthrough } from "./lib/commands";
 import { invoke } from "@tauri-apps/api/core";
+import { apiFetch, apiUrl } from "./lib/api";
+import { localDateString, shiftDate } from "./lib/dates";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getAppColor, getAppShort } from "./lib/appColors";
 import "./styles/globals.css";
@@ -60,14 +62,8 @@ type Mode = "bar" | "rewind";
 
 function App() {
   const [mode, setMode] = useState<Mode>("bar");
-  const [date, setDate] = useState(() => {
-    const now = new Date();
-    const y = now.getFullYear();
-    const m = String(now.getMonth() + 1).padStart(2, "0");
-    const d = String(now.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  });
-  const [frames, setFrames] = useState<CapturedFrame[]>([]);
+  const [date, setDate] = useState(() => localDateString());
+  const [frames, setFrames] = useState<TimelineFrame[]>([]);
   const [frameIndex, setFrameIndex] = useState(0);
   const loadingRef = useRef(false); // prevent concurrent date loads
   const lastMicToggleRef = useRef(0); // debounce poll overriding manual click
@@ -104,9 +100,7 @@ function App() {
     if (loadingRef.current) return;
     loadingRef.current = true;
     try {
-      const d = new Date(date + "T12:00:00");
-      d.setDate(d.getDate() - 1);
-      const prevDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      const prevDate = shiftDate(date, -1);
       const prevFrames = await getTimeline(prevDate);
       if (prevFrames.length > 0) {
         setFrames(prevFrames);
@@ -121,14 +115,11 @@ function App() {
   // Load next day when scrubbing past the right edge
   const loadNextDay = useCallback(async () => {
     if (loadingRef.current) return;
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    const today = localDateString();
     if (date >= today) return;
     loadingRef.current = true;
     try {
-      const d = new Date(date + "T12:00:00");
-      d.setDate(d.getDate() + 1);
-      const nextDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      const nextDate = shiftDate(date, 1);
       const nextFrames = await getTimeline(nextDate);
       if (nextFrames.length > 0) {
         setFrames(nextFrames);
@@ -142,7 +133,7 @@ function App() {
 
   const bgImageUrl = (() => {
     if (!currentFrame) return null;
-    return `http://127.0.0.1:9457/frames/${currentFrame.id}`;
+    return apiUrl(`/frames/${currentFrame.id}`);
   })();
 
   // Permission check
@@ -181,8 +172,7 @@ function App() {
     if (!hasPermission) return;
     const resetToToday = async () => {
       if (loadingRef.current) return;
-      const now = new Date();
-      const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+      const today = localDateString();
       loadingRef.current = true;
       try {
         const f = await getTimeline(today);
@@ -222,26 +212,32 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasPermission]);
 
+  // Incremental poll: only fetch rows newer than the last one we have (today only).
+  const framesRef = useRef<TimelineFrame[]>([]);
+  framesRef.current = frames;
   useEffect(() => {
     if (!hasPermission) return;
-    // Only auto-refresh if viewing today (past days don't change)
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
-    if (date !== today) return;
-    const t = setInterval(() => {
-      getTimeline(date).then((f) => {
-        // Skip if nothing changed or fetch returned empty
-        if (f.length === 0) return;
-        if (f.length !== frames.length) {
-          setFrames(f);
+    if (date !== localDateString()) return;
+    let busy = false;
+    const t = setInterval(async () => {
+      if (busy || loadingRef.current) return;
+      busy = true;
+      try {
+        const cur = framesRef.current;
+        const lastId = cur.length > 0 ? cur[cur.length - 1].id : 0;
+        const fresh = await getTimelineSince(date, lastId);
+        if (fresh.length > 0) {
+          const prevLen = cur.length;
+          const merged = [...cur, ...fresh];
+          setFrames(merged);
           // Auto-follow latest if user was near the end
-          setFrameIndex((prev) => prev >= frames.length - 3 ? f.length - 1 : prev);
+          setFrameIndex((prev) => prev >= prevLen - 3 ? merged.length - 1 : prev);
         }
-      });
+      } catch {}
+      finally { busy = false; }
     }, 3000);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date, hasPermission, frames.length]);
+  }, [date, hasPermission]);
 
   const segments = (() => {
     if (frames.length === 0) return [];
@@ -316,12 +312,12 @@ function App() {
 
     let context = "";
     try {
-      const searchResp = await fetch(`http://127.0.0.1:9457/search?q=${encodeURIComponent(sq)}&limit=15`);
+      const searchResp = await apiFetch(`/search?q=${encodeURIComponent(sq)}&limit=15`);
       const searchData = await searchResp.json();
       const searchResults = searchData.results || [];
-      const timelineResp = await fetch(`http://127.0.0.1:9457/timeline?date=${date}`);
+      const timelineResp = await apiFetch(`/timeline?date=${date}&recent=30`);
       const timelineData: any[] = await timelineResp.json();
-      const recentFrames = timelineData.slice(-30);
+      const recentFrames = timelineData;
       const seen = new Set<number>();
       const allFrames: any[] = [];
       for (const r of searchResults) { if (!seen.has(r.id)) { seen.add(r.id); allFrames.push(r); } }
@@ -371,7 +367,7 @@ function App() {
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch("http://127.0.0.1:9457/meeting/status");
+        const resp = await apiFetch("/meeting/status");
         const data = await resp.json();
         const isActive = !!data.active;
         const sessionStart = data.start_ts || 0;
@@ -1042,8 +1038,7 @@ function App() {
       {showSearch && (
         <SearchPanel onClose={() => { setShowSearch(false); setHighlightQuery(""); setHighlightRegions([]); }} onSelectFrame={async (f, query, regions) => {
           // Jump to this frame's date and position on timeline
-          const d = new Date(f.timestamp / 1000);
-          const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+          const dateStr = localDateString(new Date(f.timestamp / 1000));
           // Store search query and regions for highlight in rewind mode
           setHighlightQuery(query || "");
           setHighlightRegions(regions || []);
@@ -1326,7 +1321,7 @@ function App() {
 function BottomTimeline({ timelineRef, segments, frames, scrubberPos, onInteraction, onFrameStep, hideInnerTooltip }: {
   timelineRef: React.RefObject<HTMLDivElement | null>;
   segments: { app: string; startIdx: number; endIdx: number; color: string }[];
-  frames: CapturedFrame[];
+  frames: TimelineFrame[];
   scrubberPos: number;
   onInteraction: (clientX: number) => void;
   onFrameStep: (delta: number) => void;
@@ -1418,7 +1413,7 @@ function BottomTimeline({ timelineRef, segments, frames, scrubberPos, onInteract
           const startPct = frames.length > 1 ? (seg.startIdx / (frames.length - 1)) * 100 : 0;
           const widthPct = frames.length > 1 ? ((seg.endIdx - seg.startIdx + 1) / frames.length) * 100 : 100;
           if (widthPct < 4) return null;
-          const iconUrl = `http://127.0.0.1:9457/app-icon/${encodeURIComponent(seg.app)}`;
+          const iconUrl = apiUrl(`/app-icon/${encodeURIComponent(seg.app)}`);
           return (
             <div key={i} style={{ position: "absolute", left: `${startPct + widthPct / 2}%`, transform: "translateX(-50%)" }}>
               <div style={{

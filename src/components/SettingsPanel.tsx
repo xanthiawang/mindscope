@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { AppSettings, StorageInfo } from "../lib/types";
 import { getSettings, updateSettings, getStorageInfo, cleanupOldData, listPipes, runPipe, setPipeEnabled, isWhisperAvailable, downloadWhisperModel } from "../lib/commands";
 import type { PipeInfo } from "../lib/commands";
+import { apiUrl } from "../lib/api";
 
 interface Props { onClose: () => void; }
 
@@ -101,7 +102,7 @@ export default function SettingsPanel({ onClose }: Props) {
               <div style={{ maxHeight: 200, overflowY: "auto", border: "1px solid rgba(0,0,0,0.06)", borderRadius: 10, background: "white" }}>
                 {COMMON_APPS.map((app) => {
                   const excluded = (settings.excluded_apps || []).includes(app);
-                  const iconUrl = `http://127.0.0.1:9457/app-icon/${encodeURIComponent(app)}`;
+                  const iconUrl = apiUrl(`/app-icon/${encodeURIComponent(app)}`);
                   return (
                     <label key={app} style={{
                       display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",

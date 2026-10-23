@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CapturedFrame, AppSettings, StorageInfo } from "./types";
+import type { CapturedFrame, TimelineFrame, AppSettings, StorageInfo } from "./types";
 
 // Permission (NEVER triggers dialog)
 export async function checkPermission(): Promise<boolean> {
@@ -7,6 +7,9 @@ export async function checkPermission(): Promise<boolean> {
 }
 export async function openPermissionSettings(): Promise<void> {
   return invoke("open_permission_settings");
+}
+export async function requestScreenPermission(): Promise<boolean> {
+  return invoke("request_screen_permission");
 }
 
 // Recording
@@ -20,9 +23,12 @@ export async function isRecording(): Promise<boolean> {
   return invoke("is_recording");
 }
 
-// Timeline (from SQLite)
-export async function getTimeline(date: string): Promise<CapturedFrame[]> {
+// Timeline (from SQLite) — light rows; poll incrementally with getTimelineSince
+export async function getTimeline(date: string): Promise<TimelineFrame[]> {
   return invoke("get_timeline", { date });
+}
+export async function getTimelineSince(date: string, afterId: number): Promise<TimelineFrame[]> {
+  return invoke("get_timeline_since", { date, afterId });
 }
 export async function getScreenshot(imagePath: string): Promise<string | null> {
   return invoke("get_screenshot", { imagePath });

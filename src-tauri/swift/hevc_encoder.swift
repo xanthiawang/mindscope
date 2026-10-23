@@ -1,8 +1,12 @@
 // MindScope HEVC Encoder — based on Retrace's HEVCEncoder architecture
 // Persistent process: reads frame paths from stdin, encodes to HEVC .mp4 segments
 // Usage: hevc_encoder <output_dir>
-// Input (stdin): one image file path per line
-// Output (stdout): JSON per frame {"segment":"path","frame":N,"timestamp":"ISO8601"}
+// Input (stdin): one frame per line: "<image path>" or "<image path>\t<timestamp micros>"
+// Output (stdout): JSON per frame {"segment":"path","frame":N,"timestamp":"ISO8601","ts":<micros>}
+//   `ts` echoes the timestamp MindScope passed in, so the DB row for exactly this
+//   frame can be updated (the previous MAX(id) heuristic mapped rows to the wrong frames).
+// Segment dimensions follow the first frame of each segment; a frame of a
+// different size starts a new segment instead of being stretched.
 
 import AVFoundation
 import CoreMedia
@@ -112,21 +116,27 @@ var segmentIndex = 0
 var currentWriter: HEVCWriter?
 var currentSegmentPath = ""
 
-func screenSize() -> (Int, Int) {
-    guard let screen = NSScreen.main else { return (1920, 1080) }
-    let s = screen.frame.size
-    // Half resolution for storage efficiency
-    return (Int(s.width), Int(s.height))
+/// Even-rounded pixel size of the image (HEVC needs even dimensions).
+func frameSize(_ img: CGImage) -> (Int, Int) {
+    let w = max(2, img.width - (img.width % 2))
+    let h = max(2, img.height - (img.height % 2))
+    return (w, h)
 }
 
-func startNewSegment() throws {
-    if let w = currentWriter {
-        w.finalize()
-        FileHandle.standardError.write("Segment finalized: \(currentSegmentPath) (\(w.frameCount) frames)\n".data(using: .utf8)!)
+func localDateString() -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f.string(from: Date())  // local time zone, matches MindScope's date folders
+}
+
+func startNewSegment(width w: Int, height h: Int) throws {
+    if let cur = currentWriter {
+        cur.finalize()
+        FileHandle.standardError.write("Segment finalized: \(currentSegmentPath) (\(cur.frameCount) frames)\n".data(using: .utf8)!)
     }
 
-    let (w, h) = screenSize()
-    let dateStr = ISO8601DateFormatter().string(from: Date()).prefix(10)
+    let dateStr = localDateString()
     let segDir = "\(outputDir)/\(dateStr)"
     try? FileManager.default.createDirectory(atPath: segDir, withIntermediateDirectories: true)
 
@@ -138,20 +148,27 @@ func startNewSegment() throws {
 FileHandle.standardError.write("HEVC encoder ready. Reading frame paths from stdin...\n".data(using: .utf8)!)
 
 // Read frame paths from stdin, one per line
-while let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) {
-    if line.isEmpty { continue }
-    if line == "QUIT" { break }
+while let rawLine = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) {
+    if rawLine.isEmpty { continue }
+    if rawLine == "QUIT" { break }
+
+    // "<path>\t<ts micros>" or just "<path>"
+    let parts = rawLine.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+    let path = String(parts[0])
+    let tsMicros: Int64 = parts.count > 1 ? (Int64(parts[1]) ?? 0) : 0
 
     // Load image
-    guard let image = NSImage(contentsOfFile: line),
+    guard let image = NSImage(contentsOfFile: path),
           let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-        FileHandle.standardError.write("Skip (can't load): \(line)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("Skip (can't load): \(path)\n".data(using: .utf8)!)
         continue
     }
+    let (fw, fh) = frameSize(cgImage)
 
-    // Start new segment if needed
-    if currentWriter == nil || currentWriter!.frameCount >= maxFramesPerSegment {
-        do { try startNewSegment() } catch {
+    // Start new segment if needed (count cap, or frame size changed)
+    if currentWriter == nil || currentWriter!.frameCount >= maxFramesPerSegment
+        || currentWriter!.width != fw || currentWriter!.height != fh {
+        do { try startNewSegment(width: fw, height: fh) } catch {
             FileHandle.standardError.write("Error starting segment: \(error)\n".data(using: .utf8)!)
             continue
         }
@@ -160,12 +177,12 @@ while let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) {
     // Encode frame
     if currentWriter!.appendFrame(cgImage: cgImage) {
         let ts = ISO8601DateFormatter().string(from: Date())
-        let json = "{\"segment\":\"\(currentSegmentPath)\",\"frame\":\(currentWriter!.frameCount - 1),\"timestamp\":\"\(ts)\"}"
+        let json = "{\"segment\":\"\(currentSegmentPath)\",\"frame\":\(currentWriter!.frameCount - 1),\"timestamp\":\"\(ts)\",\"ts\":\(tsMicros)}"
         print(json)
         fflush(stdout)
 
         // Delete source image (already encoded in video)
-        try? FileManager.default.removeItem(atPath: line)
+        try? FileManager.default.removeItem(atPath: path)
     }
 }
 

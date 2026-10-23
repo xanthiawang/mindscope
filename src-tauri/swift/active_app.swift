@@ -67,8 +67,13 @@ if browserBundles.contains(bundleId), let window = axWindow {
 }
 
 // Also extract and cache app icon if not already cached
-let iconDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".mindscope/data/icons")
+let msHome: URL = {
+    if let env = ProcessInfo.processInfo.environment["MINDSCOPE_HOME"], !env.isEmpty {
+        return URL(fileURLWithPath: env)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".mindscope")
+}()
+let iconDir = msHome.appendingPathComponent("data/icons")
 try? FileManager.default.createDirectory(at: iconDir, withIntermediateDirectories: true)
 let iconPath = iconDir.appendingPathComponent("\(appName).png")
 if !FileManager.default.fileExists(atPath: iconPath.path) {

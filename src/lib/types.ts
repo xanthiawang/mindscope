@@ -1,9 +1,13 @@
-// Frame from SQLite database
-export interface CapturedFrame {
+// Light timeline row from SQLite (no OCR text, no path — images are served by id)
+export interface TimelineFrame {
   id: number;
   timestamp: number; // microseconds since epoch
   app_name: string;
   window_name: string;
+}
+
+// Full frame (search results / detail views)
+export interface CapturedFrame extends TimelineFrame {
   ocr_text: string;
   image_path: string;
 }
@@ -20,6 +24,11 @@ export interface AppSettings {
   capture_audio: boolean;
   transcription_engine: string | null;
   private_browsing: boolean;
+  ffmpeg_path?: string | null;
+  claude_path?: string | null;
+  storage_budget_mb?: number;
+  claude_daily_budget?: number;
+  capture_height?: number;
 }
 
 export interface StorageInfo {

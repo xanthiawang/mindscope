@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import type { CapturedFrame } from "../lib/types";
 import { search as searchFrames, getAllApps } from "../lib/commands";
+import { apiFetch, apiUrl } from "../lib/api";
+import { localDateString } from "../lib/dates";
 import { invoke } from "@tauri-apps/api/core";
 import { getAppColor, getAppShort, getUniqueApps } from "../lib/appColors";
 
@@ -156,7 +158,7 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
     if (!q) { setMeetingHits([]); return; }
     setMeetingSearchLoading(true);
     const controller = new AbortController();
-    fetch(`http://127.0.0.1:9457/search_meetings?q=${encodeURIComponent(q)}&limit=30`, { signal: controller.signal })
+    apiFetch(`/search_meetings?q=${encodeURIComponent(q)}&limit=30`, { signal: controller.signal })
       .then((r) => r.json())
       .then((d) => setMeetingHits(d.results || []))
       .catch(() => {})
@@ -167,8 +169,7 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
   // Load audio segments when Meetings tab is active, group by session_id
   useEffect(() => {
     if (tab !== "meetings") return;
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    const today = localDateString();
     invoke<AudioSeg[]>("get_audio_segments", { date: today })
       .then((segs) => {
         const valid = segs.filter((s) => s.transcript && s.transcript.trim().length > 0);
@@ -234,7 +235,7 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
     setLoading(true);
     debounceRef.current = setTimeout(async () => {
       try {
-        const resp = await fetch(`http://127.0.0.1:9457/search?q=${encodeURIComponent(query.trim())}&limit=30`);
+        const resp = await apiFetch(`/search?q=${encodeURIComponent(query.trim())}&limit=30`);
         const data = await resp.json();
         const items = data.results || [];
         const frames = items.map((r: any) => ({
@@ -428,7 +429,7 @@ export default function SearchPanel({ onClose, onSelectFrame }: Props) {
                       onMouseLeave={(e) => { e.currentTarget.style.background = appFilter === app ? "rgba(0,0,0,0.04)" : "transparent"; }}
                     >
                       <img
-                        src={`http://127.0.0.1:9457/app-icon/${encodeURIComponent(app)}`}
+                        src={apiUrl(`/app-icon/${encodeURIComponent(app)}`)}
                         alt=""
                         style={{ width: 20, height: 20, borderRadius: 4, objectFit: "cover" }}
                         onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
@@ -736,7 +737,7 @@ function ScreenshotHighlightCard({ frame, query, regions = [], onClick }: {
   const imgRef = useRef<HTMLImageElement>(null);
 
   useEffect(() => {
-    setThumb(`http://127.0.0.1:9457/frames/${frame.id}`);
+    setThumb(apiUrl(`/frames/${frame.id}`));
   }, [frame.id]);
 
   // Filter matches, skip boxes >15% of frame, show top 3 smallest

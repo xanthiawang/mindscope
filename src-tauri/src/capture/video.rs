@@ -1,16 +1,21 @@
-//! HEVC video encoding/decoding via compiled Swift helpers
-//! Based on Retrace's architecture: capture → encode → segment → extract
-//! Encoder outputs JSON per frame: {"segment":"path","frame":N,"timestamp":"ISO8601"}
-//! Frame extraction uses frame_reader helper with disk cache for fast seek
+//! HEVC video encoding/decoding via the bundled Swift helpers
+//! (`hevc_encoder` persistent process, `frame_reader` one-shot).
+//! Encoder stdin: `<jpeg path>\t<frame timestamp micros>` per line.
+//! Encoder stdout: `{"segment":"path","frame":N,"timestamp":"ISO8601","ts":<micros>}` per frame —
+//! `ts` is echoed back so the DB row of exactly that frame can be re-pointed at `video://`.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 
+use super::helpers;
+use super::paths;
+use super::util::LockExt;
+
 static ENCODER: Mutex<Option<EncoderProcess>> = Mutex::new(None);
-/// Queue of encoder output lines (JSON per frame) — read by recorder
+/// Queue of encoder output lines (JSON per frame) — drained by the recorder.
 static ENCODER_OUTPUT: Mutex<VecDeque<EncoderFrame>> = Mutex::new(VecDeque::new());
 
 struct EncoderProcess {
@@ -21,90 +26,72 @@ struct EncoderProcess {
 pub struct EncoderFrame {
     pub segment: String,
     pub frame: u32,
+    #[serde(default)]
     pub timestamp: String,
+    /// Frame timestamp (epoch micros) that MindScope passed in; 0 for legacy encoders.
+    #[serde(default)]
+    pub ts: i64,
 }
 
-fn helpers_dir() -> PathBuf {
-    dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("bin")
-}
-
-fn segments_dir() -> PathBuf {
-    let dir = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("data").join("segments");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-fn cache_dir() -> PathBuf {
-    let dir = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("data").join("cache");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+pub fn encoder_available() -> bool {
+    helpers::helper_path("hevc_encoder").is_some()
 }
 
 /// Start the HEVC encoder background process + stdout reader thread
 pub fn start_encoder() -> Result<(), String> {
-    let encoder_bin = helpers_dir().join("hevc_encoder");
-    if !encoder_bin.exists() {
-        return Err("HEVC encoder not found. Run compilation first.".into());
-    }
-
-    let seg_dir = segments_dir();
-    let mut child = Command::new(encoder_bin.to_str().unwrap())
-        .arg(seg_dir.to_str().unwrap())
+    let seg_dir = paths::segments_dir();
+    let mut cmd = helpers::command("hevc_encoder")
+        .ok_or_else(|| "hevc_encoder helper not bundled (build.rs compiles it from swift/)".to_string())?;
+    let mut child = cmd
+        .arg(seg_dir.to_string_lossy().as_ref())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start encoder: {}", e))?;
 
-    // Spawn thread to read encoder stdout JSON lines
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    if let Ok(frame) = serde_json::from_str::<EncoderFrame>(&line) {
-                        let mut q = ENCODER_OUTPUT.lock().unwrap();
-                        q.push_back(frame);
-                        // Keep max 1000 entries to prevent memory growth
-                        while q.len() > 1000 { q.pop_front(); }
-                    }
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(frame) = serde_json::from_str::<EncoderFrame>(&line) {
+                    let mut q = ENCODER_OUTPUT.lock_or_recover();
+                    q.push_back(frame);
+                    while q.len() > 1000 { q.pop_front(); }
                 }
             }
         });
     }
 
-    let mut guard = ENCODER.lock().unwrap();
-    *guard = Some(EncoderProcess { child });
-
+    *ENCODER.lock_or_recover() = Some(EncoderProcess { child });
     log::info!("MindScope: HEVC encoder started");
     Ok(())
 }
 
-/// Send a frame (image file path) to the encoder
-pub fn encode_frame(image_path: &Path) -> bool {
-    let mut guard = ENCODER.lock().unwrap();
-    if let Some(ref mut enc) = *guard {
-        if let Some(ref mut stdin) = enc.child.stdin {
-            let path_str = image_path.to_string_lossy();
-            if writeln!(stdin, "{}", path_str).is_ok() {
-                return true;
-            }
-        }
-        log::warn!("MindScope: HEVC encoder process died, restarting...");
-        *guard = None;
+fn write_line(enc: &mut EncoderProcess, line: &str) -> bool {
+    match enc.child.stdin.as_mut() {
+        Some(stdin) => writeln!(stdin, "{}", line).is_ok(),
+        None => false,
     }
-    drop(guard);
+}
 
-    // Try to restart encoder
+/// Send a frame (image file path + its timestamp) to the encoder.
+/// Restarts the encoder once if the pipe is broken.
+pub fn encode_frame(image_path: &Path, ts_micros: i64) -> bool {
+    let line = format!("{}\t{}", image_path.to_string_lossy(), ts_micros);
+    {
+        let mut guard = ENCODER.lock_or_recover();
+        if let Some(enc) = guard.as_mut() {
+            if write_line(enc, &line) { return true; }
+            log::warn!("MindScope: HEVC encoder process died, restarting...");
+            let _ = enc.child.kill();
+            let _ = enc.child.wait();
+            *guard = None;
+        }
+    }
     if start_encoder().is_ok() {
-        let mut guard = ENCODER.lock().unwrap();
-        if let Some(ref mut enc) = *guard {
-            if let Some(ref mut stdin) = enc.child.stdin {
-                let path_str = image_path.to_string_lossy();
-                return writeln!(stdin, "{}", path_str).is_ok();
-            }
+        if let Some(enc) = ENCODER.lock_or_recover().as_mut() {
+            return write_line(enc, &line);
         }
     }
     false
@@ -112,49 +99,51 @@ pub fn encode_frame(image_path: &Path) -> bool {
 
 /// Drain encoder output queue — called by recorder to get segment/frame info
 pub fn drain_encoder_output() -> Vec<EncoderFrame> {
-    let mut q = ENCODER_OUTPUT.lock().unwrap();
-    q.drain(..).collect()
+    ENCODER_OUTPUT.lock_or_recover().drain(..).collect()
 }
 
 /// Stop the encoder gracefully
 pub fn stop_encoder() {
-    let mut guard = ENCODER.lock().unwrap();
-    if let Some(ref mut enc) = *guard {
-        if let Some(ref mut stdin) = enc.child.stdin {
-            let _ = writeln!(stdin, "QUIT");
+    let mut guard = ENCODER.lock_or_recover();
+    if let Some(enc) = guard.as_mut() {
+        let _ = write_line(enc, "QUIT");
+        // Give it a moment to finalize the segment, then make sure it is gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match enc.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+                _ => { let _ = enc.child.kill(); let _ = enc.child.wait(); break; }
+            }
         }
-        let _ = enc.child.wait();
     }
     *guard = None;
     log::info!("MindScope: HEVC encoder stopped");
 }
 
 /// Extract a single frame from an HEVC video segment as JPEG bytes
-/// Uses disk cache: ~/.mindscope/data/cache/<hash>.jpg
+/// Uses disk cache: data/cache/<hash>.jpg
 pub fn extract_frame(video_path: &str, frame_index: u32) -> Option<Vec<u8>> {
-    // Check disk cache first
+    // Only ever read segments that live under our own data dir.
+    let seg_root = paths::segments_dir();
+    let vp = Path::new(video_path);
+    if !vp.starts_with(&seg_root) || !vp.is_file() { return None; }
+
     let cache_key = format!("{}_{}", video_path.replace('/', "_"), frame_index);
-    let cache_path = cache_dir().join(format!("{}.jpg", cache_key));
-    if cache_path.exists() {
-        if let Ok(bytes) = std::fs::read(&cache_path) {
-            return Some(bytes);
-        }
+    let cache_path = paths::cache_dir().join(format!("{}.jpg", cache_key));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        return Some(bytes);
     }
 
-    // Extract via frame_reader helper
-    let reader_bin = helpers_dir().join("frame_reader");
-    if !reader_bin.exists() { return None; }
-
-    let output = Command::new(reader_bin.to_str().unwrap())
-        .args([video_path, &frame_index.to_string()])
+    let idx = frame_index.to_string();
+    let output = helpers::command("frame_reader")?
+        .args([video_path, &idx])
+        .stderr(Stdio::null())
         .output()
         .ok()?;
 
     if output.status.success() && !output.stdout.is_empty() {
-        // Cache to disk
         let _ = std::fs::write(&cache_path, &output.stdout);
-        // Evict old cache entries (keep max 500 files)
-        evict_cache(500);
         Some(output.stdout)
     } else {
         log::warn!("MindScope: frame extraction failed for {}:{}", video_path, frame_index);
@@ -168,33 +157,39 @@ pub fn extract_frame_base64(video_path: &str, frame_index: u32) -> Option<String
     Some(super::db::base64_encode_bytes(&jpeg))
 }
 
-/// Evict oldest cache files if over limit
-fn evict_cache(max_files: usize) {
-    let dir = cache_dir();
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+/// Evict oldest cache files if over `max_files` or `max_bytes`. Called by the retention loop.
+pub fn evict_cache(max_files: usize, max_bytes: u64) -> (usize, u64) {
+    let dir = paths::cache_dir();
+    let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&dir)
         .ok()
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "jpg"))
         .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((modified, e.path()))
+            let meta = e.metadata().ok()?;
+            Some((meta.modified().ok()?, e.path(), meta.len()))
         })
         .collect();
-
-    if entries.len() <= max_files { return; }
-
-    entries.sort_by_key(|(t, _)| *t);
-    let to_remove = entries.len() - max_files;
-    for (_, path) in entries.iter().take(to_remove) {
-        let _ = std::fs::remove_file(path);
+    entries.sort_by_key(|(t, _, _)| *t);
+    let mut total: u64 = entries.iter().map(|e| e.2).sum();
+    let mut count = entries.len();
+    let mut removed = (0usize, 0u64);
+    for (_, path, size) in entries {
+        if count <= max_files && total <= max_bytes { break; }
+        if std::fs::remove_file(&path).is_ok() {
+            count -= 1;
+            total -= size;
+            removed.0 += 1;
+            removed.1 += size;
+        }
     }
+    removed
 }
 
 /// List all video segments
 pub fn list_segments() -> Vec<SegmentInfo> {
-    let seg_dir = segments_dir();
+    let seg_dir = paths::segments_dir();
     let mut segments = Vec::new();
 
     if let Ok(dates) = std::fs::read_dir(&seg_dir) {

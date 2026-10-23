@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { apiFetch } from "../lib/api";
 
 // --- SVG Icons (Apple SF-style, no emoji) ---
 const MicIcon = () => (
@@ -41,7 +42,7 @@ export default function MeetingBar({ onExpand }: MeetingBarProps) {
   useEffect(() => {
     const poll = async () => {
       try {
-        const resp = await fetch("http://127.0.0.1:9457/meeting/status");
+        const resp = await apiFetch("/meeting/status");
         const data = await resp.json();
         setActive(data.active);
         setAppName(data.app_name || "");

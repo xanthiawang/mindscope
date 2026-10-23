@@ -13,11 +13,11 @@ MindScope runs silently in the background, capturing your screen and audio into 
 ## Install
 
 1. Download `MindScope_0.1.0_aarch64.dmg` from [Releases](https://github.com/xanthiawang/mindscope/releases/latest) and drag to Applications.
-2. Grant **Screen Recording** and **Microphone** in System Settings → Privacy & Security.
-3. Install `ffmpeg` for audio recording — `brew install ffmpeg`.
-4. *(Optional)* Install `claude` CLI for AI features — `brew install claude`.
+2. Launch it once; macOS asks for **Screen Recording**. Grant it in System Settings → Privacy & Security → Screen Recording (and **Microphone** when you first press the mic button or a meeting is detected).
+3. Install `ffmpeg` for audio recording — `brew install ffmpeg` (any location on your `PATH` or in `~/.local/bin` works).
+4. *(Optional)* Install the `claude` CLI for AI features — `npm install -g @anthropic-ai/claude-code` (found via `PATH`, `~/.local/bin`, Homebrew; or set `claude_path` in `~/.mindscope/settings.json`).
 
-**Requirements:** macOS 11+ (tested on Sequoia 15), Apple Silicon recommended.
+**Requirements:** macOS 11+ (meeting detection is most accurate on macOS 14+), Apple Silicon recommended.
 
 ---
 
@@ -102,9 +102,10 @@ Everything is local. No data leaves your Mac. All files live under `~/.mindscope
 ├── synapse/             # AI skill definitions
 ├── models/
 │   └── ggml-base.bin    # Multilingual Whisper
-├── bin/                 # Swift helpers
-└── settings.json
+└── settings.json        # incl. ffmpeg_path / claude_path overrides, storage_budget_mb
 ```
+
+Swift helpers ship inside the app bundle, not in `~/.mindscope`. Set `MINDSCOPE_HOME` to relocate the whole tree.
 
 **Typical storage:** ~400 MB/day with default settings. Adjust retention in Settings.
 
@@ -114,14 +115,37 @@ Everything is local. No data leaves your Mac. All files live under `~/.mindscope
 
 ## Build from Source
 
+Prerequisites (one-time):
+
+```sh
+xcode-select --install                 # Swift toolchain for the helper CLIs (swiftc)
+brew install rustup cmake              # Rust via rustup; cmake builds whisper.cpp
+rustup toolchain install stable        # Homebrew's rustup puts cargo in $(brew --prefix rustup)/bin
+export PATH="$(brew --prefix rustup)/bin:$PATH"
+brew install ffmpeg                    # audio capture (runtime dependency)
+```
+
+Build:
+
 ```sh
 git clone https://github.com/xanthiawang/mindscope.git
 cd mindscope
 npm install
-MACOSX_DEPLOYMENT_TARGET=11.0 npx tauri build
+npm run tauri build
 ```
 
-Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg`.
+`src-tauri/build.rs` compiles every Swift helper in `src-tauri/swift/` (`ocr_helper`, `hevc_encoder`, `frame_reader`, `screen_info`, `active_app`, `system_audio`, `is_meeting`, `topmost_window`) and bundles them as sidecars inside `MindScope.app/Contents/MacOS/`. Nothing needs to be pre-installed in `~/.mindscope/bin`.
+
+Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg` (`.app` under `bundle/macos/`).
+
+Development:
+
+```sh
+npm run tauri dev      # Vite + cargo run; helpers are copied to src-tauri/target/debug/
+cd src-tauri && cargo test --lib     # unit tests (PII, local-time, text helpers)
+```
+
+Set `MINDSCOPE_HOME=/some/throwaway/dir` to run against an empty data directory instead of `~/.mindscope` (settings, DB, frames, vault all live under it). Screen Recording permission is granted per app bundle, so for permission-dependent testing run the built `.app` rather than the dev binary.
 
 ---
 
@@ -129,11 +153,11 @@ Output at `src-tauri/target/release/bundle/dmg/MindScope_0.1.0_aarch64.dmg`.
 
 **Screenshots show only the desktop wallpaper.** TCC Screen Recording permission is stale. Run `tccutil reset ScreenCapture com.mindscope.rewind`, re-grant under System Settings, then quit and relaunch.
 
-**Meeting detected but no transcription.** Check `ffmpeg` is installed at `/opt/homebrew/bin/ffmpeg` and the Whisper model exists at `~/.mindscope/models/ggml-base.bin`.
+**Meeting detected but no transcription.** Check `ffmpeg` is on your `PATH` (or set `ffmpeg_path` in `~/.mindscope/settings.json`) and the Whisper model exists at `~/.mindscope/models/ggml-base.bin`. The app log lists the resolved `ffmpeg`/`claude` paths at startup.
 
 **MindScope not in Privacy → Microphone.** Click the mic button in the bar — macOS will show the permission dialog on first use.
 
-**Synapse loop not updating working memory.** Install Claude CLI (`brew install claude`) and verify it runs without errors in `~/.mindscope/vault/`. The loop routes through Claude Haiku — if you see quota warnings, check your subscription usage.
+**Synapse loop not updating working memory.** Install the Claude CLI (`npm install -g @anthropic-ai/claude-code`) and verify `claude -p "hi"` works in a terminal. The loop routes through Claude Haiku, skips passes when nothing new was recorded, and stops after `claude_daily_budget` calls per day (default 120, in `settings.json`).
 
 
 ---

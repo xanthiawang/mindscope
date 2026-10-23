@@ -39,3 +39,5 @@ regex = "1"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 ndarray = "0.16"
+libc = "0.2"
+block = "0.1"

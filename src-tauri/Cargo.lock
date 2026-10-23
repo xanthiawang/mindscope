@@ -3330,11 +3330,13 @@ name = "mindscope"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "block",
  "cocoa",
  "dirs-next",
  "glob",
  "hound",
  "image",
+ "libc",
  "log",
  "lru",
  "ndarray",

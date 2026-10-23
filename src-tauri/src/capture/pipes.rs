@@ -2,18 +2,16 @@
 //! Pipes are YAML-defined automations that query screen data and run through Claude CLI
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn pipes_dir() -> PathBuf {
-    let dir = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("pipes");
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
+use super::claude_cli;
+use super::text;
+use super::timeutil;
+
+fn pipes_dir() -> PathBuf { super::paths::pipes_dir() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipeConfig {
@@ -117,7 +115,7 @@ pub fn run_pipe(id: &str) -> Result<PipeResult, String> {
     let config: PipeConfig = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
 
     // Gather context from screen history
-    let hours = config.context_hours.unwrap_or(24);
+    let hours = config.context_hours.unwrap_or(24).min(24 * 14);
     let context = gather_context(&config.context_query, hours);
 
     // Build prompt with context
@@ -127,8 +125,8 @@ pub fn run_pipe(id: &str) -> Result<PipeResult, String> {
         format!("Based on this screen activity history:\n\n{}\n\n{}", context, config.prompt)
     };
 
-    // Call Claude CLI
-    let output = call_claude(&full_prompt)?;
+    // Call Claude CLI (background profile: Haiku, tool-free, timeout, daily budget)
+    let output = claude_cli::run_background(&format!("pipe:{}", id), &full_prompt)?;
 
     // Route output
     match config.output.as_str() {
@@ -154,7 +152,7 @@ pub fn run_pipe(id: &str) -> Result<PipeResult, String> {
         "notification" => {
             #[cfg(target_os = "macos")]
             {
-                let short = if output.len() > 200 { &output[..200] } else { &output };
+                let short = text::truncate_chars(&output, 200);
                 let script = format!(
                     "display notification \"{}\" with title \"MindScope: {}\"",
                     short.replace('"', "'"), config.name.replace('"', "'")
@@ -189,17 +187,11 @@ fn gather_context(query: &Option<String>, hours: u32) -> String {
         .unwrap_or_default()
         .as_micros() as i64 - (hours as i64 * 3600 * 1_000_000);
 
-    // If query provided, search; otherwise get recent frames
+    // If query provided, search; otherwise get the recent frames directly by time range
     let frames = if let Some(q) = query {
         super::db::search_frames(q, 20).unwrap_or_default()
     } else {
-        // Get today's frames (last N hours)
-        let today = chrono_now();
-        let date = &today[..10];
-        super::db::get_frames_for_date(date).unwrap_or_default()
-            .into_iter()
-            .filter(|f| f.timestamp >= cutoff)
-            .collect()
+        super::db::get_frames_in_range(cutoff, timeutil::now_micros(), 0).unwrap_or_default()
     };
 
     if frames.is_empty() { return String::new(); }
@@ -208,60 +200,25 @@ fn gather_context(query: &Option<String>, hours: u32) -> String {
     let mut context = String::new();
     let mut last_app = String::new();
     for frame in frames.iter().take(50) {
-        let ts_secs = frame.timestamp / 1_000_000;
-        let hour = (ts_secs % 86400) / 3600;
-        let min = (ts_secs % 3600) / 60;
+        let lt = timeutil::local_time(frame.timestamp / 1_000_000);
+        let (hour, min) = (lt.hour, lt.min);
 
         if frame.app_name != last_app {
             context.push_str(&format!("\n[{:02}:{:02}] {} - {}\n", hour, min, frame.app_name, frame.window_name));
             last_app = frame.app_name.clone();
         }
 
-        // Extract just the text portion (before regions separator)
-        let text = if let Some(idx) = frame.ocr_text.find("\n---REGIONS---\n") {
-            &frame.ocr_text[..idx]
-        } else {
-            &frame.ocr_text
-        };
-
-        if !text.is_empty() && text.len() > 10 {
-            // Truncate long OCR text
-            let short = if text.len() > 200 { &text[..200] } else { text };
-            context.push_str(&format!("  {}\n", short));
+        let text_part = frame.ocr_text.as_str();
+        if text::char_len(text_part) > 10 {
+            context.push_str(&format!("  {}\n", text::truncate_chars(text_part, 200)));
         }
     }
 
     context
 }
 
-/// Call Claude CLI inside the MindScope vault (picks up CLAUDE.md + skills).
-/// Routes through Haiku — pipes are background scheduled tasks, not interactive.
-fn call_claude(prompt: &str) -> Result<String, String> {
-    let vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
-    let cwd = if vault.exists() { vault } else { dirs_next::home_dir().unwrap_or_default() };
-
-    let result = std::process::Command::new("/opt/homebrew/bin/claude")
-        .args(["-p", prompt, "--model", "claude-haiku-4-5"])
-        .current_dir(&cwd)
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if response.is_empty() {
-                Err("Empty response from Claude".into())
-            } else {
-                Ok(response)
-            }
-        }
-        Ok(output) => Err(format!("Claude error: {}", String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>())),
-        Err(e) => Err(format!("Claude not found: {}", e)),
-    }
-}
-
 fn chrono_now() -> String {
-    super::recorder::timestamp_now()
+    timeutil::local_timestamp()
 }
 
 /// Create default example pipes
@@ -344,49 +301,15 @@ fn get_last_run_epoch(pipe_id: &str) -> Option<u64> {
     parse_timestamp_to_epoch(&result.timestamp)
 }
 
-/// Parse a "YYYY-MM-DDTHH:MM:SS" timestamp to epoch seconds (UTC)
+/// Parse a local "YYYY-MM-DDTHH:MM:SS" timestamp to epoch seconds
 fn parse_timestamp_to_epoch(ts: &str) -> Option<u64> {
-    // Expected format: "2026-04-09T14:30:00" or similar
-    if ts.len() < 19 { return None; }
-    let year: u64 = ts[0..4].parse().ok()?;
-    let month: u64 = ts[5..7].parse().ok()?;
-    let day: u64 = ts[8..10].parse().ok()?;
-    let hour: u64 = ts[11..13].parse().ok()?;
-    let min: u64 = ts[14..16].parse().ok()?;
-    let sec: u64 = ts[17..19].parse().ok()?;
-
-    // Days from epoch to start of year
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    // Days in months of current year
-    let leap = is_leap(year);
-    let month_days = if leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    for m in 0..(month as usize - 1).min(11) {
-        days += month_days[m];
-    }
-    days += day - 1;
-
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+    let micros = timeutil::parse_local_datetime_micros(ts)?;
+    Some((micros / 1_000_000).max(0) as u64)
 }
 
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-/// Get current UTC hour and minute from SystemTime
-fn current_utc_hm() -> (u32, u32) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let tod = secs % 86400;
-    ((tod / 3600) as u32, ((tod % 3600) / 60) as u32)
+/// Current local hour and minute ("daily HH:MM" schedules are local time)
+fn current_local_hm() -> (u32, u32) {
+    timeutil::local_hm()
 }
 
 /// Check if a pipe is due to run based on its schedule and last_run time
@@ -409,7 +332,7 @@ fn is_pipe_due(pipe: &PipeInfo) -> bool {
             now_epoch >= last_run_epoch + interval_secs
         }
         ParsedSchedule::DailyAt { hour, minute } => {
-            let (cur_h, cur_m) = current_utc_hm();
+            let (cur_h, cur_m) = current_local_hm();
             // Check if we're in the right minute window (within 2 min of target)
             let target_min_of_day = hour * 60 + minute;
             let cur_min_of_day = cur_h * 60 + cur_m;

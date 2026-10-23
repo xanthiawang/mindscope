@@ -108,7 +108,6 @@ Synapse fires 48 times a day. Sonnet would burn through a Pro subscription fast.
 │   └── user.*.md            ❄ Per person
 ├── synapse/                 Bundled skills
 ├── models/ggml-base.bin     Whisper (141 MB)
-├── bin/                     Swift helpers
 └── settings.json
 ```
 

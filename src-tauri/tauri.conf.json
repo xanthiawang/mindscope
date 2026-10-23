@@ -50,6 +50,16 @@
     ],
     "macOS": {
       "infoPlist": "Info.plist"
-    }
+    },
+    "externalBin": [
+      "binaries/ocr_helper",
+      "binaries/hevc_encoder",
+      "binaries/frame_reader",
+      "binaries/screen_info",
+      "binaries/active_app",
+      "binaries/system_audio",
+      "binaries/is_meeting",
+      "binaries/topmost_window"
+    ]
   }
 }

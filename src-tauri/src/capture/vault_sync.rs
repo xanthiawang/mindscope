@@ -19,34 +19,26 @@ use std::thread;
 use std::time::Duration;
 
 use super::audio;
+use super::claude_cli;
 use super::db;
-use super::recorder;
+use super::paths;
+use super::text;
+use super::timeutil;
 
 // Guard: only one sync loop thread at a time
 static SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Find the MindScope vault directory (~/.mindscope/vault/).
-/// Created by synapse::bootstrap() on first launch.
+/// The MindScope vault directory ($MINDSCOPE_HOME/vault/), if bootstrapped.
 fn vault_dir() -> Option<PathBuf> {
-    let home = dirs_next::home_dir()?;
-    let ms = home.join(".mindscope").join("vault");
-    if ms.exists() {
-        return Some(ms);
-    }
-    None
+    let ms = paths::vault_dir();
+    if ms.exists() { Some(ms) } else { None }
 }
 
-/// Today's date as "YYYY-MM-DD"
-fn today_date() -> String {
-    recorder::timestamp_now()[..10].to_string()
-}
+/// Today's local date as "YYYY-MM-DD"
+fn today_date() -> String { timeutil::today() }
 
-/// Current hour (0-23) from timestamp
-fn current_hour() -> u64 {
-    let ts = recorder::timestamp_now();
-    // Format: "YYYY-MM-DDThh:mm:ss"
-    ts[11..13].parse().unwrap_or(0)
-}
+/// Current local hour (0-23)
+fn current_hour() -> u64 { timeutil::local_hour() as u64 }
 
 // ─── 1. Daily brief ──────────────────────────────────────────────
 
@@ -58,10 +50,10 @@ pub fn generate_daily_brief() -> String {
     };
 
     let mut brief = String::new();
-    let ms_vault = dirs_next::home_dir().unwrap_or_default().join(".mindscope").join("vault");
+    let ms_vault = paths::vault_dir();
 
     // ─── Section 1: Now — currently active app and latest context ───
-    let (current_app, current_window, _, _) = super::screenshot::get_active_window_info();
+    let (current_app, current_window, _) = super::screenshot::get_active_window_info();
     if !current_app.is_empty() && current_app != "Unknown" {
         brief.push_str(&format!("## Now\n{}", current_app));
         if !current_window.is_empty() && current_window != current_app {
@@ -135,14 +127,10 @@ pub fn generate_daily_brief() -> String {
 /// Returns Vec<(app_name, minutes)> sorted by time desc.
 fn app_time_breakdown(hours: u64) -> Vec<(String, u64)> {
     let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
+    let frames = db::get_frames_lite_for_date(&date, None).unwrap_or_default();
     if frames.is_empty() { return Vec::new(); }
 
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    let cutoff = now_us - (hours as i64 * 3600 * 1_000_000);
+    let cutoff = timeutil::now_micros() - (hours as i64 * 3600 * 1_000_000);
 
     let mut app_counts: HashMap<String, u64> = HashMap::new();
     for f in frames.iter().filter(|f| f.timestamp >= cutoff) {
@@ -171,14 +159,14 @@ fn list_recent_meetings(vault: &Path, limit: usize) -> Vec<String> {
             if !name.starts_with("meet.") || !name.ends_with(".md") { continue; }
             if let Ok(content) = fs::read_to_string(entry.path()) {
                 // Parse frontmatter: title, date, app, duration
-                let title = content.lines().find(|l| l.starts_with("title:"))
-                    .map(|l| l[6..].trim().to_string())
+                let title = content.lines().find_map(|l| l.strip_prefix("title:"))
+                    .map(|v| v.trim().to_string())
                     .unwrap_or_default();
-                let date = content.lines().find(|l| l.starts_with("date:"))
-                    .map(|l| l[5..].trim().to_string())
+                let date = content.lines().find_map(|l| l.strip_prefix("date:"))
+                    .map(|v| v.trim().to_string())
                     .unwrap_or_default();
-                let app = content.lines().find(|l| l.starts_with("app:"))
-                    .map(|l| l[4..].trim().to_string())
+                let app = content.lines().find_map(|l| l.strip_prefix("app:"))
+                    .map(|v| v.trim().to_string())
                     .unwrap_or_default();
 
                 // Extract first real content line from Summary section
@@ -218,18 +206,16 @@ fn list_recent_meetings(vault: &Path, limit: usize) -> Vec<String> {
 
 /// Format "2026-04-10" → "Apr 10" (short display)
 fn format_date_short(date: &str) -> String {
-    if date.len() < 10 { return date.to_string(); }
+    let Some((_, month, day)) = timeutil::parse_date(date) else { return date.to_string(); };
     let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    let month: usize = date[5..7].parse().unwrap_or(1);
-    let day: u32 = date[8..10].parse().unwrap_or(1);
-    let month_name = months.get(month.saturating_sub(1)).copied().unwrap_or("");
+    let month_name = months.get((month as usize).saturating_sub(1)).copied().unwrap_or("");
     format!("{} {}", month_name, day)
 }
 
 /// Today's capture stats: frames captured, active apps, time span.
 fn today_stats() -> String {
     let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
+    let frames = db::get_frames_lite_for_date(&date, None).unwrap_or_default();
     if frames.is_empty() { return String::new(); }
 
     let app_set: std::collections::HashSet<&str> = frames.iter()
@@ -272,18 +258,11 @@ fn infer_focus_from_activity() -> Option<String> {
     }
 
     // Gather the last 2 hours of screen activity
-    let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
-    if frames.is_empty() { return None; }
-
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
+    let now_us = timeutil::now_micros();
     let cutoff = now_us - (2 * 3600 * 1_000_000);
-
-    let recent: Vec<_> = frames.iter().filter(|f| f.timestamp >= cutoff).collect();
-    if recent.len() < 3 { return None; }
+    let frames = db::get_frames_in_range(cutoff, now_us, 0).unwrap_or_default();
+    if frames.len() < 3 { return None; }
+    let recent: Vec<_> = frames.iter().collect();
 
     // Build a compact summary: app transitions + sample OCR snippets
     let mut sample_text = String::new();
@@ -295,18 +274,14 @@ fn infer_focus_from_activity() -> Option<String> {
             last_app = f.app_name.clone();
         }
         // Sample OCR text — pick non-empty, reasonable length
-        if !f.ocr_text.is_empty() && f.ocr_text.len() > 20 {
+        if text::char_len(&f.ocr_text) > 20 {
             ocr_samples.push(&f.ocr_text);
         }
     }
 
     // Take first 5 OCR samples, truncated
     let ocr_snippet: String = ocr_samples.iter().take(5)
-        .map(|t| {
-            // Strip the ---REGIONS--- block if present
-            let clean = t.split("---REGIONS---").next().unwrap_or(t);
-            clean.chars().take(200).collect::<String>()
-        })
+        .map(|t| text::take_chars(t, 200))
         .collect::<Vec<_>>()
         .join(" | ");
 
@@ -321,9 +296,9 @@ fn infer_focus_from_activity() -> Option<String> {
         ocr_snippet.chars().take(1500).collect::<String>(),
     );
 
-    let response = call_claude(&prompt)?;
+    let response = claude_cli::run_background("focus", &prompt).ok()?;
     let focus_line = response.lines().next().unwrap_or("").trim().to_string();
-    if focus_line.is_empty() || focus_line.len() > 200 { return None; }
+    if focus_line.is_empty() || text::char_len(&focus_line) > 200 { return None; }
 
     // Cache it
     if let Ok(mut f) = fs::File::create(&cache_path) {
@@ -366,7 +341,7 @@ pub fn generate_daily_journal(date: &str) {
         for entry in entries.flatten() {
             if let Ok(content) = fs::read_to_string(&entry) {
                 let body = content.split("---").nth(2).unwrap_or("").trim();
-                meetings_text.push_str(&format!("\n{}\n", &body[..body.len().min(500)]));
+                meetings_text.push_str(&format!("\n{}\n", text::truncate_chars(body, 500)));
             }
         }
     }
@@ -390,12 +365,12 @@ pub fn generate_daily_journal(date: &str) {
          Format: Start with a 2-sentence summary. Then ## Highlights (3-5 bullets). \
          Then ## Time Breakdown (restate app usage). Keep it short and factual.",
         date,
-        &app_summary[..app_summary.len().min(1000)],
-        &meetings_text[..meetings_text.len().min(1500)],
-        &transcript[..transcript.len().min(1500)]
+        text::truncate_chars(&app_summary, 1000),
+        text::truncate_chars(&meetings_text, 1500),
+        text::truncate_chars(&transcript, 1500)
     );
 
-    let body = call_claude(&prompt).unwrap_or_else(|| {
+    let body = claude_cli::run_background("daily-journal", &prompt).unwrap_or_else(|_| {
         // Fallback: raw data
         format!(
             "## Summary\nActivity recorded on {}.\n\n## App Usage\n{}\n\n## Notes\n{}",
@@ -405,10 +380,7 @@ pub fn generate_daily_journal(date: &str) {
         )
     });
 
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let epoch = timeutil::now_secs();
 
     let content = format!(
         "---\ntitle: Journal {}\ndate: {}\nupdated: {}\n---\n\n{}",
@@ -442,8 +414,8 @@ pub fn update_working_memory() {
     };
 
     let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
-    let app_times = compute_app_times(&frames);
+    let frames = db::get_frames_lite_for_date(&date, None).unwrap_or_default();
+    let app_times = compute_app_times_lite(&frames);
 
     // Build the replacement section
     let mut table = String::from("## Today's Activity\n\n| Time | App | Duration |\n|------|-----|----------|\n");
@@ -453,19 +425,12 @@ pub fn update_working_memory() {
 
     // Replace existing section or append
     let new_content = if let Some(start) = content.find("## Today's Activity") {
-        let end = content[start..]
+        // End = next "\n## " heading after the section title (byte offsets from find() are char boundaries)
+        let after_title = start + "## Today's Activity".len();
+        let end = content[after_title..]
             .find("\n## ")
-            .map(|i| start + i)
+            .map(|i| after_title + i + 1)
             .unwrap_or(content.len());
-        // Check if "## Today's Activity" is followed by another section
-        let end = if start + 1 < content.len() {
-            content[start + 1..]
-                .find("\n## ")
-                .map(|i| start + 1 + i + 1)
-                .unwrap_or(content.len())
-        } else {
-            content.len()
-        };
         format!("{}{}\n{}", &content[..start], table, &content[end..])
     } else {
         // No existing section — don't add one, just skip
@@ -497,8 +462,7 @@ pub fn refresh_people_contacts() {
     for f in &frames {
         haystack.push_str(&f.window_name);
         haystack.push(' ');
-        let ocr = f.ocr_text.split("\n---REGIONS---\n").next().unwrap_or("");
-        haystack.push_str(ocr);
+        haystack.push_str(&f.ocr_text);
         haystack.push(' ');
     }
     let haystack_lower = haystack.to_lowercase();
@@ -523,7 +487,7 @@ pub fn refresh_people_contacts() {
         let name = extract_frontmatter_field(&content, "title")
             .unwrap_or_else(|| filename.strip_prefix("user.").unwrap_or(&filename).replace('-', " "));
 
-        if name.len() < 2 {
+        if text::char_len(&name) < 2 {
             continue;
         }
 
@@ -543,8 +507,8 @@ fn update_last_contact(path: &Path, content: &str, date: &str) {
         .map(|line| {
             if line.to_lowercase().contains("last contact") && line.contains(':') {
                 updated = true;
-                let prefix = &line[..line.find(':').unwrap() + 1];
-                format!("{} {}", prefix, date)
+                let (prefix, _) = line.split_once(':').unwrap_or((line, ""));
+                format!("{}: {}", prefix, date)
             } else {
                 line.to_string()
             }
@@ -578,10 +542,7 @@ pub fn start_vault_sync_loop() {
         loop {
             thread::sleep(Duration::from_secs(60)); // Check every minute
 
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now_secs = timeutil::now_secs() as u64;
 
             // Hourly sync (every 3600 seconds)
             if now_secs - last_hourly >= 3600 {
@@ -642,12 +603,20 @@ fn extract_frontmatter_field(content: &str, key: &str) -> Option<String> {
 /// Compute time spent per app from a list of frames.
 /// Returns vec of (app_name, minutes) sorted by minutes descending.
 fn compute_app_times(frames: &[db::FrameRow]) -> Vec<(String, u64)> {
+    app_times_from_names(frames.iter().map(|f| f.app_name.as_str()))
+}
+
+fn compute_app_times_lite(frames: &[db::FrameLite]) -> Vec<(String, u64)> {
+    app_times_from_names(frames.iter().map(|f| f.app_name.as_str()))
+}
+
+fn app_times_from_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<(String, u64)> {
     let mut app_counts: HashMap<String, u64> = HashMap::new();
-    for f in frames {
-        if f.app_name.is_empty() || f.is_idle() {
+    for name in names {
+        if name.is_empty() || name == "idle" {
             continue;
         }
-        *app_counts.entry(f.app_name.clone()).or_insert(0) += 1;
+        *app_counts.entry(name.to_string()).or_insert(0) += 1;
     }
 
     // Each frame is ~2 seconds apart (capture interval), convert to minutes
@@ -658,77 +627,4 @@ fn compute_app_times(frames: &[db::FrameRow]) -> Vec<(String, u64)> {
         .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     sorted
-}
-
-/// Build a short summary of recent app activity (last N hours).
-fn recent_app_summary(hours: u64) -> String {
-    let date = today_date();
-    let frames = db::get_frames_for_date(&date).unwrap_or_default();
-    if frames.is_empty() {
-        return String::new();
-    }
-
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    let cutoff = now_us - (hours as i64 * 3600 * 1_000_000);
-
-    let recent: Vec<_> = frames.iter().filter(|f| f.timestamp >= cutoff).collect();
-    let mut app_counts: HashMap<String, u64> = HashMap::new();
-    for f in &recent {
-        if f.app_name.is_empty() {
-            continue;
-        }
-        *app_counts.entry(f.app_name.clone()).or_insert(0) += 1;
-    }
-
-    let mut sorted: Vec<_> = app_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-    sorted
-        .iter()
-        .take(5)
-        .map(|(app, count)| format!("{} ({}m)", app, count * 2 / 60))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Call Claude CLI with a prompt. Runs inside the MindScope vault so Claude
-/// picks up the bundled CLAUDE.md + .claude/skills/ from synapse bootstrap.
-/// Routes through Haiku — vault_sync is background summarization, not reasoning.
-fn call_claude(prompt: &str) -> Option<String> {
-    let vault = dirs_next::home_dir()?.join(".mindscope").join("vault");
-    let cwd = if vault.exists() {
-        vault
-    } else {
-        dirs_next::home_dir()?
-    };
-    let output = std::process::Command::new("/opt/homebrew/bin/claude")
-        .args(["-p", prompt, "--model", "claude-haiku-4-5"])
-        .current_dir(&cwd)
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !text.is_empty() {
-            Some(text)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-/// Helper trait to check idle on FrameRow (no is_idle field exposed, check app_name)
-trait FrameIdle {
-    fn is_idle(&self) -> bool;
-}
-
-impl FrameIdle for db::FrameRow {
-    fn is_idle(&self) -> bool {
-        self.app_name == "idle" || self.app_name.is_empty()
-    }
 }

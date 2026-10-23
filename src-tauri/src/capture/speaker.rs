@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Speaker identification using audio feature comparison.
 //! Simplified version without ONNX — uses audio spectral features + cosine similarity.
 //! When a proper ONNX model is available, this can be upgraded.

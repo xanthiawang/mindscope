@@ -1,20 +1,24 @@
-//! Whisper transcription engine using whisper-rs (whisper.cpp bindings)
-//! Parameters tuned from Screenpipe's production config for best accuracy
+//! Whisper transcription engine using whisper-rs (whisper.cpp bindings).
+//! The model context (~150 MB for ggml-base + Metal buffers) is loaded lazily on
+//! the first transcription and released again with `unload()` when no audio
+//! session is active, so idle RSS stays low.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
-static WHISPER_CTX: Mutex<Option<whisper_rs::WhisperContext>> = Mutex::new(None);
+use super::paths;
+use super::util::LockExt;
 
-fn models_dir() -> PathBuf {
-    let dir = dirs_next::home_dir().unwrap_or_default()
-        .join(".mindscope").join("models");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+struct Engine {
+    ctx: whisper_rs::WhisperContext,
+    /// Reused across batches — creating a state per 2 s batch churned tens of MB.
+    state: whisper_rs::WhisperState,
 }
 
+static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+
 fn default_model_path() -> PathBuf {
-    models_dir().join("ggml-base.bin")
+    paths::models_dir().join("ggml-base.bin")
 }
 
 /// Check if Whisper model is downloaded
@@ -22,126 +26,66 @@ pub fn is_model_available() -> bool {
     default_model_path().exists()
 }
 
+/// Is the model currently resident in memory?
+pub fn is_loaded() -> bool {
+    ENGINE.lock_or_recover().is_some()
+}
+
+/// Release the Whisper context (frees model weights + Metal buffers).
+pub fn unload() {
+    let mut guard = ENGINE.lock_or_recover();
+    if guard.take().is_some() {
+        log::info!("MindScope: Whisper context unloaded");
+    }
+}
+
 /// Download Whisper model from Hugging Face using curl (avoids nested runtime issues)
 pub fn download_model() -> Result<(), String> {
     let model_path = default_model_path();
     if model_path.exists() { return Ok(()); }
 
-    let _ = std::fs::create_dir_all(models_dir());
+    let _ = std::fs::create_dir_all(paths::models_dir());
     log::info!("MindScope: Downloading Whisper model via curl...");
     let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
+    let tmp = model_path.with_extension("bin.part");
 
     let status = std::process::Command::new("curl")
-        .args(["-L", "-o", model_path.to_str().unwrap_or(""), url])
+        .args(["-L", "--fail", "-o", tmp.to_str().unwrap_or(""), url])
         .status()
         .map_err(|e| format!("Download failed: {}", e))?;
 
-    if status.success() && model_path.exists() {
-        let size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    if status.success() && size > 1_000_000 {
+        std::fs::rename(&tmp, &model_path).map_err(|e| format!("rename failed: {}", e))?;
         log::info!("MindScope: Whisper model downloaded ({:.1} MB)", size as f64 / 1_048_576.0);
-        if size < 1_000_000 {
-            let _ = std::fs::remove_file(&model_path);
-            return Err("Download incomplete — file too small".into());
-        }
         Ok(())
     } else {
-        let _ = std::fs::remove_file(&model_path);
-        Err("Download failed".into())
+        let _ = std::fs::remove_file(&tmp);
+        Err("Download failed or incomplete".into())
     }
 }
 
-/// Initialize Whisper context (lazy, first call only)
-fn ensure_context() -> Result<(), String> {
-    let mut guard = WHISPER_CTX.lock().unwrap();
+fn ensure_loaded(guard: &mut Option<Engine>) -> Result<(), String> {
     if guard.is_some() { return Ok(()); }
-
     let model_path = default_model_path();
     if !model_path.exists() {
         return Err("Whisper model not downloaded".into());
     }
-
     let ctx = whisper_rs::WhisperContext::new_with_params(
-        model_path.to_str().unwrap(),
+        model_path.to_str().unwrap_or(""),
         whisper_rs::WhisperContextParameters::default(),
     ).map_err(|e| format!("Whisper init failed: {:?}", e))?;
-
-    *guard = Some(ctx);
+    let state = ctx.create_state().map_err(|e| format!("State error: {:?}", e))?;
+    *guard = Some(Engine { ctx, state });
     log::info!("MindScope: Whisper context initialized");
     Ok(())
 }
 
-/// Transcribe raw PCM samples directly from memory (no file I/O).
-/// Input: f32 samples normalized to [-1, 1] at 16kHz mono
-/// Used by the streaming audio pipeline for real-time transcription.
-pub fn transcribe_samples(samples: &[f32]) -> Result<String, String> {
-    if samples.is_empty() { return Ok(String::new()); }
-
-    // Skip silence (RMS energy gate)
-    let rms = (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64).sqrt();
-    if rms < 0.015 { return Ok(String::new()); }
-
-    ensure_context()?;
-    let guard = WHISPER_CTX.lock().unwrap();
-    let ctx = guard.as_ref().ok_or("Whisper not initialized")?;
-    let mut state = ctx.create_state().map_err(|e| format!("State error: {:?}", e))?;
-
+fn params() -> whisper_rs::FullParams<'static, 'static> {
     let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(4);
-    params.set_language(None);
+    params.set_language(None);  // auto-detect (Chinese, English, ...)
     params.set_translate(false);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_blank(true);
-    params.set_suppress_nst(true);
-    params.set_entropy_thold(2.2);
-    params.set_logprob_thold(-1.5);
-    params.set_no_speech_thold(0.5);
-    params.set_max_tokens(128);
-
-    state.full(params, samples).map_err(|e| format!("Transcribe error: {:?}", e))?;
-
-    let num_segments = state.full_n_segments();
-    let mut text = String::new();
-    for i in 0..num_segments {
-        if let Some(segment) = state.get_segment(i) {
-            if let Ok(segment_text) = segment.to_str_lossy() {
-                text.push_str(&segment_text);
-                text.push(' ');
-            }
-        }
-    }
-
-    Ok(deduplicate_text(text.trim()))
-}
-
-/// Transcribe audio file using Whisper
-/// Input: path to m4a/wav file
-/// Output: transcribed text
-pub fn transcribe(audio_path: &Path) -> Result<String, String> {
-    // Convert to WAV 16kHz mono if needed
-    let wav_path = convert_to_wav(audio_path)?;
-    let samples = load_wav_samples(&wav_path)?;
-
-    // Skip silence (RMS energy gate — from Screenpipe)
-    let rms = (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64).sqrt();
-    if rms < 0.015 {
-        log::info!("MindScope: Skipping silent audio (RMS={:.4})", rms);
-        return Ok(String::new());
-    }
-
-    ensure_context()?;
-    let guard = WHISPER_CTX.lock().unwrap();
-    let ctx = guard.as_ref().ok_or("Whisper not initialized")?;
-
-    let mut state = ctx.create_state().map_err(|e| format!("State error: {:?}", e))?;
-
-    // Whisper parameters — tuned for multilingual (Chinese + English)
-    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(2);
-    params.set_language(None); // Auto-detect language (Chinese, English, etc.)
-    params.set_translate(false); // Keep original language, don't translate to English
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -152,14 +96,30 @@ pub fn transcribe(audio_path: &Path) -> Result<String, String> {
     params.set_entropy_thold(2.2);
     params.set_logprob_thold(-1.5);
     params.set_no_speech_thold(0.5);
-    params.set_max_tokens(128); // Limit tokens per segment to prevent runaway repetition
+    params.set_max_tokens(128);
+    params
+}
 
-    state.full(params, &samples).map_err(|e| format!("Transcribe error: {:?}", e))?;
+/// Transcribe raw PCM samples directly from memory (no file I/O).
+/// Input: f32 samples normalized to [-1, 1] at 16kHz mono.
+pub fn transcribe_samples(samples: &[f32]) -> Result<String, String> {
+    if samples.is_empty() { return Ok(String::new()); }
 
-    let num_segments = state.full_n_segments();
+    // Skip silence (RMS energy gate)
+    let rms = (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64).sqrt();
+    if rms < 0.015 { return Ok(String::new()); }
+
+    let mut guard = ENGINE.lock_or_recover();
+    ensure_loaded(&mut guard)?;
+    let engine = guard.as_mut().ok_or("Whisper not initialized")?;
+    let _ = &engine.ctx;
+
+    engine.state.full(params(), samples).map_err(|e| format!("Transcribe error: {:?}", e))?;
+
+    let num_segments = engine.state.full_n_segments();
     let mut text = String::new();
     for i in 0..num_segments {
-        if let Some(segment) = state.get_segment(i) {
+        if let Some(segment) = engine.state.get_segment(i) {
             if let Ok(segment_text) = segment.to_str_lossy() {
                 text.push_str(&segment_text);
                 text.push(' ');
@@ -167,80 +127,17 @@ pub fn transcribe(audio_path: &Path) -> Result<String, String> {
         }
     }
 
-    // Clean up temp wav
-    if wav_path != audio_path {
-        let _ = std::fs::remove_file(&wav_path);
-    }
-
-    // Post-process: remove hallucinated repetitions
-    let text = deduplicate_text(text.trim());
-    Ok(text)
-}
-
-/// Convert m4a to WAV 16kHz mono using afconvert (macOS)
-fn convert_to_wav(audio_path: &Path) -> Result<PathBuf, String> {
-    let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext == "wav" {
-        return Ok(audio_path.to_path_buf());
-    }
-
-    let wav_path = audio_path.with_extension("wav");
-    let status = std::process::Command::new("afconvert")
-        .args([
-            "-d", "LEI16",           // 16-bit little-endian integer
-            "-c", "1",               // mono
-            "-r", "16000",           // 16kHz
-            audio_path.to_str().unwrap_or(""),
-            wav_path.to_str().unwrap_or(""),
-        ])
-        .status()
-        .map_err(|e| format!("afconvert failed: {}", e))?;
-
-    if status.success() {
-        Ok(wav_path)
-    } else {
-        Err("afconvert failed".into())
-    }
-}
-
-/// Load WAV file as f32 samples normalized to [-1, 1]
-fn load_wav_samples(wav_path: &Path) -> Result<Vec<f32>, String> {
-    let reader = hound::WavReader::open(wav_path)
-        .map_err(|e| format!("WAV open failed: {}", e))?;
-    let spec = reader.spec();
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let max_val = (1i32 << (spec.bits_per_sample - 1)) as f32;
-            reader.into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
-        }
-        hound::SampleFormat::Float => {
-            reader.into_samples::<f32>()
-                .filter_map(|s| s.ok())
-                .collect()
-        }
-    };
-
-    // If stereo, average to mono
-    if spec.channels == 2 {
-        Ok(samples.chunks(2).map(|c| (c[0] + c.get(1).copied().unwrap_or(0.0)) / 2.0).collect())
-    } else {
-        Ok(samples)
-    }
+    Ok(deduplicate_text(text.trim()))
 }
 
 /// Remove hallucinated repetitions from Whisper output.
 /// Supports both English (split by .) and Chinese (split by 。，)
 fn deduplicate_text(text: &str) -> String {
-    // Split by sentence boundaries (English + Chinese punctuation)
     let mut sentences: Vec<String> = Vec::new();
     let mut current = String::new();
     for c in text.chars() {
         current.push(c);
-        if matches!(c, '.' | '。' | '！' | '？') || (c == ' ' && current.trim().len() > 15) {
+        if matches!(c, '.' | '。' | '！' | '？') || (c == ' ' && current.trim().chars().count() > 15) {
             let trimmed = current.trim().to_string();
             if !trimmed.is_empty() && trimmed != "." && trimmed != "。" {
                 sentences.push(trimmed);
@@ -253,7 +150,6 @@ fn deduplicate_text(text: &str) -> String {
 
     if sentences.len() < 3 { return text.to_string(); }
 
-    // Detect repeated phrases
     let mut result: Vec<String> = Vec::new();
     let mut prev = String::new();
     let mut repeat_count = 0;

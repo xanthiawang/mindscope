@@ -2,10 +2,13 @@
 //!
 //! Schema design:
 //! - `frames` table: one row per screenshot (like OpenReLife's `entries`)
-//! - `search_index` FTS5 table: full-text search on OCR text (like Retrace's `searchRanking`)
+//!   `ocr_text` holds plain text (FTS-indexed); `ocr_regions` holds the bounding
+//!   box JSON (NOT indexed). Legacy rows that packed both into `ocr_text` with a
+//!   `---REGIONS---` separator are split on first start.
+//! - `search_index` FTS5 table: full-text search on OCR text
 //! - `segments` table: continuous app-focus periods (like Retrace's `segment`)
 //!
-//! All data is local. Screenshots stored as WebP files on disk.
+//! All data is local, under `paths::data_dir()`.
 
 use rusqlite::OptionalExtension;
 use std::fs;
@@ -13,41 +16,33 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use super::paths;
+use super::timeutil;
+use super::util::LockExt;
+
 static DB: Mutex<Option<rusqlite::Connection>> = Mutex::new(None);
 
-fn db_path() -> PathBuf {
-    let dir = data_dir();
-    dir.join("mindscope.db")
-}
+const REGIONS_SEP: &str = "\n---REGIONS---\n";
 
-pub fn data_dir() -> PathBuf {
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = home.join(".mindscope").join("data");
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
+pub fn data_dir() -> PathBuf { paths::data_dir() }
+pub fn frames_dir(date: &str) -> PathBuf { paths::frames_dir(date) }
 
-pub fn frames_dir(date: &str) -> PathBuf {
-    let dir = data_dir().join("frames").join(date);
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
-
-/// Initialize database and create tables
+/// Initialize database and create tables. Idempotent.
 pub fn init_db() -> Result<(), String> {
-    let path = db_path();
+    if DB.lock_or_recover().is_some() { return Ok(()); }
+
+    let path = paths::db_path();
     let conn = rusqlite::Connection::open(&path).map_err(|e| format!("DB open: {}", e))?;
 
-    // Performance pragmas (same as Retrace)
     conn.execute_batch("
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
-        PRAGMA cache_size = -65536;
+        PRAGMA cache_size = -16384;
         PRAGMA temp_store = MEMORY;
+        PRAGMA busy_timeout = 5000;
     ").map_err(|e| format!("DB pragmas: {}", e))?;
 
-    // Core tables
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS frames (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +60,6 @@ pub fn init_db() -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_frames_app ON frames(app_name);
         CREATE INDEX IF NOT EXISTS idx_frames_segment ON frames(segment_id);
 
-        -- App focus segments (like Retrace)
         CREATE TABLE IF NOT EXISTS segments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT NOT NULL,
@@ -78,7 +72,6 @@ pub fn init_db() -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_segments_time ON segments(start_time, end_time);
 
-        -- FTS5 full-text search (like Retrace's searchRanking)
         CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
             ocr_text,
             app_name,
@@ -88,7 +81,6 @@ pub fn init_db() -> Result<(), String> {
             tokenize='porter unicode61'
         );
 
-        -- Triggers to keep FTS in sync
         CREATE TRIGGER IF NOT EXISTS frames_ai AFTER INSERT ON frames BEGIN
             INSERT INTO search_index(rowid, ocr_text, app_name, window_name)
             VALUES (new.id, new.ocr_text, new.app_name, new.window_name);
@@ -106,15 +98,46 @@ pub fn init_db() -> Result<(), String> {
             VALUES (new.id, new.ocr_text, new.app_name, new.window_name);
         END;
 
-        -- Settings
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
     ").map_err(|e| format!("DB schema: {}", e))?;
 
-    let mut guard = DB.lock().unwrap();
-    *guard = Some(conn);
+    // Migration: regions JSON out of the FTS-indexed column.
+    let has_regions_col: bool = conn
+        .prepare("PRAGMA table_info(frames)")
+        .and_then(|mut s| {
+            let names = s.query_map([], |r| r.get::<_, String>(1))?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+            Ok(names.iter().any(|n| n == "ocr_regions"))
+        })
+        .unwrap_or(false);
+    if !has_regions_col {
+        conn.execute_batch("ALTER TABLE frames ADD COLUMN ocr_regions TEXT NOT NULL DEFAULT ''")
+            .map_err(|e| format!("DB migrate ocr_regions: {}", e))?;
+    }
+    let packed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM frames WHERE instr(ocr_text, char(10)||'---REGIONS---'||char(10)) > 0",
+            [], |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if packed > 0 {
+        log::info!("MindScope: migrating {} packed OCR rows into ocr_regions column", packed);
+        let started = Instant::now();
+        let res = conn.execute_batch("
+            UPDATE frames SET
+                ocr_regions = substr(ocr_text, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) + 15),
+                ocr_text    = substr(ocr_text, 1, instr(ocr_text, char(10)||'---REGIONS---'||char(10)) - 1)
+            WHERE instr(ocr_text, char(10)||'---REGIONS---'||char(10)) > 0;
+        ");
+        match res {
+            Ok(_) => log::info!("MindScope: OCR regions migration done in {:.1}s", started.elapsed().as_secs_f32()),
+            Err(e) => log::warn!("MindScope: OCR regions migration failed: {}", e),
+        }
+    }
+
+    *DB.lock_or_recover() = Some(conn);
     log::info!("MindScope: Database initialized at {:?}", path);
     Ok(())
 }
@@ -123,46 +146,37 @@ fn with_db<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce(&rusqlite::Connection) -> Result<T, rusqlite::Error>,
 {
-    let guard = DB.lock().unwrap();
+    let guard = DB.lock_or_recover();
     match guard.as_ref() {
         Some(conn) => f(conn).map_err(|e| format!("{}", e)),
         None => Err("Database not initialized".to_string()),
     }
 }
 
-/// Insert a video frame (from HEVC segment)
-pub fn insert_video_frame(
+/// Insert a captured frame (text and regions stored separately).
+pub fn insert_frame(
     timestamp: i64,
     app_name: &str,
     window_name: &str,
     ocr_text: &str,
-    segment_path: &str,
-    frame_index: u32,
-) -> Result<(), String> {
-    // Store segment:frame_index as image_path for video frames
-    let video_ref = format!("video://{}#{}", segment_path, frame_index);
-    insert_frame(timestamp, app_name, window_name, ocr_text, &video_ref)
-}
-
-/// Insert frame with OCR regions (stored as JSON in ocr_text field: "text\n---\nJSON_REGIONS")
-pub fn insert_frame_with_regions(
-    timestamp: i64,
-    app_name: &str,
-    window_name: &str,
-    ocr: &super::ocr::OcrResult,
+    ocr_regions_json: &str,
     image_path: &str,
 ) -> Result<(), String> {
-    // Pack text + regions into ocr_text field (text first, then JSON regions after separator)
-    let regions_json = serde_json::to_string(&ocr.regions).unwrap_or_default();
-    let packed = format!("{}\n---REGIONS---\n{}", ocr.text, regions_json);
-    insert_frame(timestamp, app_name, window_name, &packed, image_path)
+    with_db(|conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO frames (timestamp, app_name, window_name, ocr_text, ocr_regions, image_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![timestamp, app_name, window_name, ocr_text, ocr_regions_json, image_path],
+        )?;
+        Ok(())
+    })
 }
 
-/// Unpack OCR regions from the packed format
+/// Split a legacy packed `ocr_text` ("text\n---REGIONS---\njson") into (text, regions).
 pub fn unpack_ocr_regions(ocr_text: &str) -> (String, Vec<super::ocr::OcrRegion>) {
-    if let Some(idx) = ocr_text.find("\n---REGIONS---\n") {
+    if let Some(idx) = ocr_text.find(REGIONS_SEP) {
         let text = ocr_text[..idx].to_string();
-        let json = &ocr_text[idx + 15..];
+        let json = &ocr_text[idx + REGIONS_SEP.len()..];
         let regions: Vec<super::ocr::OcrRegion> = serde_json::from_str(json).unwrap_or_default();
         (text, regions)
     } else {
@@ -170,36 +184,18 @@ pub fn unpack_ocr_regions(ocr_text: &str) -> (String, Vec<super::ocr::OcrRegion>
     }
 }
 
-/// Insert a captured frame
-pub fn insert_frame(
-    timestamp: i64,
-    app_name: &str,
-    window_name: &str,
-    ocr_text: &str,
-    image_path: &str,
-) -> Result<(), String> {
-    with_db(|conn| {
-        conn.execute(
-            "INSERT OR IGNORE INTO frames (timestamp, app_name, window_name, ocr_text, image_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![timestamp, app_name, window_name, ocr_text, image_path],
-        )?;
-        Ok(())
-    })
-}
-
 /// A pending frame to be written in a batch transaction.
 struct PendingFrame {
     timestamp: i64,
     app_name: String,
     window_name: String,
-    ocr_packed: String,
+    ocr_text: String,
+    ocr_regions: String,
     image_path: String,
 }
 
-/// Batched frame writer inspired by Screenpipe's write coalescing pattern.
-/// Buffers frames and flushes them in a single SQLite transaction to reduce
-/// write lock contention and WAL overhead.
+/// Batched frame writer: buffers frames and flushes them in a single SQLite
+/// transaction to reduce write lock contention and WAL overhead.
 pub struct FrameBuffer {
     pending: Mutex<Vec<PendingFrame>>,
     last_flush: Mutex<Instant>,
@@ -208,9 +204,6 @@ pub struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    /// Create a new FrameBuffer.
-    /// - `max_batch_size`: flush when this many frames are buffered (e.g. 5)
-    /// - `max_age_secs`: flush when oldest buffered frame is this old (e.g. 10)
     pub fn new(max_batch_size: usize, max_age_secs: u64) -> Self {
         Self {
             pending: Mutex::new(Vec::with_capacity(max_batch_size)),
@@ -220,7 +213,6 @@ impl FrameBuffer {
         }
     }
 
-    /// Add a frame to the buffer (does not write to DB yet).
     pub fn buffer_frame(
         &self,
         timestamp: i64,
@@ -229,88 +221,86 @@ impl FrameBuffer {
         ocr: &super::ocr::OcrResult,
         image_path: &str,
     ) {
-        let regions_json = serde_json::to_string(&ocr.regions).unwrap_or_default();
-        let packed = format!("{}\n---REGIONS---\n{}", ocr.text, regions_json);
-
-        let mut pending = self.pending.lock().unwrap();
-        pending.push(PendingFrame {
+        let regions_json = if ocr.regions.is_empty() { String::new() } else {
+            serde_json::to_string(&ocr.regions).unwrap_or_default()
+        };
+        self.pending.lock_or_recover().push(PendingFrame {
             timestamp,
             app_name: app_name.to_string(),
             window_name: window_name.to_string(),
-            ocr_packed: packed,
+            ocr_text: ocr.text.clone(),
+            ocr_regions: regions_json,
             image_path: image_path.to_string(),
         });
     }
 
-    /// Check if flush thresholds are met and flush if so.
-    /// Call this after every `buffer_frame()`.
-    pub fn maybe_flush(&self) -> Result<(), String> {
-        let should_flush = {
-            let pending = self.pending.lock().unwrap();
-            let last_flush = self.last_flush.lock().unwrap();
-            pending.len() >= self.max_batch_size
-                || (!pending.is_empty() && last_flush.elapsed().as_secs() >= self.max_age_secs)
-        };
-        if should_flush {
-            self.flush_frames()
+    /// Re-point a still-buffered frame at its `video://` reference. Returns false
+    /// if the frame was already flushed (caller then updates the DB).
+    pub fn update_path_by_ts(&self, timestamp: i64, new_path: &str) -> bool {
+        let mut pending = self.pending.lock_or_recover();
+        if let Some(f) = pending.iter_mut().find(|f| f.timestamp == timestamp) {
+            f.image_path = new_path.to_string();
+            true
         } else {
-            Ok(())
+            false
         }
     }
 
-    /// Flush all buffered frames to the database in a single transaction.
-    /// Uses BEGIN/COMMIT for atomicity and reduced WAL overhead.
-    pub fn flush_frames(&self) -> Result<(), String> {
-        let frames: Vec<PendingFrame> = {
-            let mut pending = self.pending.lock().unwrap();
-            std::mem::take(&mut *pending)
+    pub fn maybe_flush(&self) -> Result<(), String> {
+        let should_flush = {
+            let pending = self.pending.lock_or_recover();
+            let last_flush = self.last_flush.lock_or_recover();
+            pending.len() >= self.max_batch_size
+                || (!pending.is_empty() && last_flush.elapsed().as_secs() >= self.max_age_secs)
         };
+        if should_flush { self.flush_frames() } else { Ok(()) }
+    }
 
-        if frames.is_empty() {
-            return Ok(());
-        }
+    pub fn flush_frames(&self) -> Result<(), String> {
+        let frames: Vec<PendingFrame> = std::mem::take(&mut *self.pending.lock_or_recover());
+        if frames.is_empty() { return Ok(()); }
 
         let count = frames.len();
         let result = with_db(|conn| {
-            conn.execute_batch("BEGIN TRANSACTION")?;
+            let tx = conn.unchecked_transaction()?;
             for f in &frames {
-                conn.execute(
-                    "INSERT OR IGNORE INTO frames (timestamp, app_name, window_name, ocr_text, image_path)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![f.timestamp, f.app_name, f.window_name, f.ocr_packed, f.image_path],
+                tx.execute(
+                    "INSERT OR IGNORE INTO frames (timestamp, app_name, window_name, ocr_text, ocr_regions, image_path)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![f.timestamp, f.app_name, f.window_name, f.ocr_text, f.ocr_regions, f.image_path],
                 )?;
             }
-            conn.execute_batch("COMMIT")?;
+            tx.commit()?;
             Ok(())
         });
 
         match &result {
             Ok(_) => {
-                let mut last_flush = self.last_flush.lock().unwrap();
-                *last_flush = Instant::now();
+                *self.last_flush.lock_or_recover() = Instant::now();
                 log::debug!("MindScope: flushed {} frames in batch transaction", count);
             }
             Err(e) => {
-                // On failure, try to rollback and re-buffer the frames
-                let _ = with_db(|conn| {
-                    conn.execute_batch("ROLLBACK").ok();
-                    Ok(())
-                });
-                // Put frames back so they can be retried
-                let mut pending = self.pending.lock().unwrap();
-                for f in frames {
-                    pending.push(f);
-                }
+                let mut pending = self.pending.lock_or_recover();
+                pending.extend(frames);
                 log::error!("MindScope: batch flush failed ({}), {} frames re-buffered", e, count);
             }
         }
-
         result
     }
 }
 
-/// Update the most recent frame's image_path to a video:// reference
-/// Called when encoder confirms a frame has been encoded
+/// Re-point the frame with exactly this timestamp at a `video://` reference.
+pub fn update_frame_path_by_timestamp(timestamp: i64, video_ref: &str) -> Result<bool, String> {
+    with_db(|conn| {
+        let n = conn.execute(
+            "UPDATE frames SET image_path = ?1 WHERE timestamp = ?2",
+            rusqlite::params![video_ref, timestamp],
+        )?;
+        Ok(n > 0)
+    })
+}
+
+/// Legacy fallback (encoder without `ts`): update the newest non-video row.
 pub fn update_latest_frame_path(video_ref: &str) -> Result<(), String> {
     with_db(|conn| {
         conn.execute(
@@ -321,101 +311,130 @@ pub fn update_latest_frame_path(video_ref: &str) -> Result<(), String> {
     })
 }
 
-/// Frame data for frontend
+/// Full frame row (search results, by-id lookups, background summarisers).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FrameRow {
     pub id: i64,
     pub timestamp: i64,
     pub app_name: String,
     pub window_name: String,
+    /// Plain OCR text (never contains regions JSON).
     pub ocr_text: String,
     pub image_path: String,
+    /// Bounding-box JSON; not sent to the UI (fetched via /frames/:id/text).
+    #[serde(skip)]
+    pub regions_json: String,
 }
 
-/// Get frames for a date range
+impl FrameRow {
+    pub fn regions(&self) -> Vec<super::ocr::OcrRegion> {
+        if self.regions_json.is_empty() { return vec![]; }
+        serde_json::from_str(&self.regions_json).unwrap_or_default()
+    }
+}
+
+/// Light row for the timeline: no OCR text, no image path (images are served by id).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FrameLite {
+    pub id: i64,
+    pub timestamp: i64,
+    pub app_name: String,
+    pub window_name: String,
+}
+
+const FULL_COLS: &str = "id, timestamp, app_name, window_name, ocr_text, image_path, ocr_regions";
+
+fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameRow> {
+    let raw_text: String = row.get(4)?;
+    let mut regions_json: String = row.get(6)?;
+    let text = if raw_text.contains(REGIONS_SEP) {
+        let (t, regs) = unpack_ocr_regions(&raw_text);
+        if regions_json.is_empty() && !regs.is_empty() {
+            regions_json = serde_json::to_string(&regs).unwrap_or_default();
+        }
+        t
+    } else {
+        raw_text
+    };
+    Ok(FrameRow {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        app_name: row.get(2)?,
+        window_name: row.get(3)?,
+        ocr_text: text,
+        image_path: row.get(5)?,
+        regions_json,
+    })
+}
+
+fn row_to_lite(row: &rusqlite::Row<'_>) -> rusqlite::Result<FrameLite> {
+    Ok(FrameLite {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        app_name: row.get(2)?,
+        window_name: row.get(3)?,
+    })
+}
+
+/// Full rows for a local calendar date (used by summarisers; the UI uses the lite variant).
 pub fn get_frames_for_date(date: &str) -> Result<Vec<FrameRow>, String> {
-    // Convert date "2026-04-09" to microsecond range
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 { return Ok(vec![]); }
-    let y: i64 = parts[0].parse().unwrap_or(0);
-    let m: i64 = parts[1].parse().unwrap_or(0);
-    let d: i64 = parts[2].parse().unwrap_or(0);
+    let Some((start, end)) = timeutil::local_day_bounds_micros(date) else { return Ok(vec![]); };
+    get_frames_in_range(start, end, 0)
+}
 
-    // Get local timezone offset, then compute precise UTC boundaries for this local date
-    // Use current local time vs UTC to determine offset
-    let now_utc = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    // Get local time components to compute offset
-    // Simple approach: parse "date" command output for timezone offset
-    let tz_offset_secs: i64 = std::process::Command::new("date")
-        .args(["+%z"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // Format: "+0800" or "-0500"
-            if s.len() >= 5 {
-                let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-                let hours: i64 = s[1..3].parse().unwrap_or(0);
-                let mins: i64 = s[3..5].parse().unwrap_or(0);
-                Some(sign * (hours * 3600 + mins * 60))
-            } else { None }
-        })
-        .unwrap_or(0);
+/// Full rows with timestamp in [start, end). `limit` 0 = unlimited.
+pub fn get_frames_in_range(start: i64, end: i64, limit: i64) -> Result<Vec<FrameRow>, String> {
+    with_db(|conn| {
+        let sql = format!(
+            "SELECT {FULL_COLS} FROM frames WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp ASC {}",
+            if limit > 0 { format!("LIMIT {limit}") } else { String::new() }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![start, end], row_to_frame)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })
+}
 
-    // Precise day boundaries
-    let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let mut days: i64 = 0;
-    for yr in 1970..y {
-        days += if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
-    }
-    for mo in 0..(m - 1) as usize {
-        days += if mo == 1 && is_leap { 29 } else { month_days[mo] };
-    }
-    days += d - 1;
-    // Convert to UTC micros, adjusting for local timezone
-    let start = (days * 86400 - tz_offset_secs) * 1_000_000;
-    let end = start + 86400 * 1_000_000;
-
+/// Light rows for a local date, optionally only those with id > `after_id`.
+pub fn get_frames_lite_for_date(date: &str, after_id: Option<i64>) -> Result<Vec<FrameLite>, String> {
+    let Some((start, end)) = timeutil::local_day_bounds_micros(date) else { return Ok(vec![]); };
     with_db(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_name, ocr_text, image_path
-             FROM frames WHERE timestamp >= ?1 AND timestamp < ?2
-             ORDER BY timestamp ASC"
+            "SELECT id, timestamp, app_name, window_name FROM frames
+             WHERE timestamp >= ?1 AND timestamp < ?2 AND id > ?3
+             ORDER BY timestamp ASC",
         )?;
-        let rows = stmt.query_map(rusqlite::params![start, end], |row| {
-            Ok(FrameRow {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_name: row.get(3)?,
-                ocr_text: row.get(4)?,
-                image_path: row.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params![start, end, after_id.unwrap_or(0)], row_to_lite)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })
+}
+
+/// The newest `limit` full rows of a local date (ascending), for AI context.
+pub fn get_recent_frames_for_date(date: &str, limit: i64) -> Result<Vec<FrameRow>, String> {
+    let Some((start, end)) = timeutil::local_day_bounds_micros(date) else { return Ok(vec![]); };
+    with_db(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM (SELECT {FULL_COLS} FROM frames WHERE timestamp >= ?1 AND timestamp < ?2
+             ORDER BY timestamp DESC LIMIT ?3) ORDER BY timestamp ASC"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![start, end, limit], row_to_frame)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     })
 }
 
 /// Search frames — hybrid approach:
 /// - English words: FTS5 with wildcard prefix matching
-/// - Chinese/non-ASCII: LIKE fallback (FTS5 can't tokenize Chinese)
-/// - Single characters: LIKE fallback
+/// - Chinese/non-ASCII or very short queries: LIKE fallback
 pub fn search_frames(query: &str, limit: i64) -> Result<Vec<FrameRow>, String> {
     if query.trim().is_empty() { return Ok(vec![]); }
 
     let has_non_ascii = query.chars().any(|c| !c.is_ascii());
-    let is_short = query.trim().len() <= 2;
+    let is_short = query.trim().chars().count() <= 2;
 
-    // Use LIKE for Chinese, short queries, or single chars (FTS5 can't handle these well)
     if has_non_ascii || is_short {
         return search_frames_like(query, limit);
     }
 
-    // Try FTS5 first for English words
     let fts_query: String = query
         .split_whitespace()
         .map(|word| {
@@ -430,74 +449,48 @@ pub fn search_frames(query: &str, limit: i64) -> Result<Vec<FrameRow>, String> {
 
     let fts_result = with_db(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT f.id, f.timestamp, f.app_name, f.window_name, f.ocr_text, f.image_path
+            "SELECT f.id, f.timestamp, f.app_name, f.window_name, f.ocr_text, f.image_path, f.ocr_regions
              FROM search_index si
              JOIN frames f ON f.id = si.rowid
              WHERE search_index MATCH ?1
              ORDER BY rank
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(rusqlite::params![fts_query, limit], |row| {
-            Ok(FrameRow {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_name: row.get(3)?,
-                ocr_text: row.get(4)?,
-                image_path: row.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params![fts_query, limit], row_to_frame)?;
         Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
     });
 
-    // If FTS5 returns nothing, fall back to LIKE
     match fts_result {
         Ok(results) if !results.is_empty() => Ok(results),
         _ => search_frames_like(query, limit),
     }
 }
 
-/// LIKE-based search fallback — works for any language including Chinese
 fn search_frames_like(query: &str, limit: i64) -> Result<Vec<FrameRow>, String> {
-    let pattern = format!("%{}%", query.trim());
-
+    let pattern = format!("%{}%", query.trim().replace('%', "\\%").replace('_', "\\_"));
     with_db(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_name, ocr_text, image_path
-             FROM frames
-             WHERE ocr_text LIKE ?1
-                OR app_name LIKE ?1
-                OR window_name LIKE ?1
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FULL_COLS} FROM frames
+             WHERE ocr_text LIKE ?1 ESCAPE '\\'
+                OR app_name LIKE ?1 ESCAPE '\\'
+                OR window_name LIKE ?1 ESCAPE '\\'
              ORDER BY timestamp DESC
              LIMIT ?2"
-        )?;
-        let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
-            Ok(FrameRow {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_name: row.get(3)?,
-                ocr_text: row.get(4)?,
-                image_path: row.get(5)?,
-            })
-        })?;
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit], row_to_frame)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     })
 }
 
-/// Get storage statistics
+/// Get storage statistics (walks the data dir — call from a background thread).
 pub fn get_storage_stats() -> Result<StorageStats, String> {
-    let total_size = dir_size_bytes(&data_dir());
+    let total_size = dir_size_bytes(&paths::data_dir());
     let total_mb = total_size as f64 / (1024.0 * 1024.0);
 
     let (frame_count, oldest, newest) = with_db(|conn| {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))?;
-        let oldest: Option<i64> = conn.query_row(
-            "SELECT MIN(timestamp) FROM frames", [], |r| r.get(0)
-        ).ok();
-        let newest: Option<i64> = conn.query_row(
-            "SELECT MAX(timestamp) FROM frames", [], |r| r.get(0)
-        ).ok();
+        let oldest: Option<i64> = conn.query_row("SELECT MIN(timestamp) FROM frames", [], |r| r.get(0)).ok();
+        let newest: Option<i64> = conn.query_row("SELECT MAX(timestamp) FROM frames", [], |r| r.get(0)).ok();
         Ok((count, oldest, newest))
     })?;
 
@@ -525,41 +518,62 @@ pub struct StorageStats {
     pub newest_timestamp: i64,
 }
 
-/// Delete frames older than N days
-pub fn cleanup_old_frames(retention_days: u32) -> Result<u32, String> {
-    if retention_days == 0 { return Ok(0); }
+/// Number of frames and the highest frame id — cheap "did anything happen" signal.
+pub fn frame_watermark() -> (i64, i64) {
+    with_db(|conn| {
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))?;
+        let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM frames", [], |r| r.get(0))?;
+        Ok((count, max_id))
+    }).unwrap_or((0, 0))
+}
 
-    let cutoff = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64 - (retention_days as i64 * 86400 * 1_000_000);
+/// Oldest frame timestamp (micros), if any.
+pub fn oldest_frame_timestamp() -> Option<i64> {
+    with_db(|conn| conn.query_row("SELECT MIN(timestamp) FROM frames", [], |r| r.get::<_, Option<i64>>(0)))
+        .ok()
+        .flatten()
+}
 
-    // Get image paths to delete
+/// Delete frame rows (and their standalone JPEGs) older than `cutoff_micros`.
+/// Returns (rows deleted, files deleted). Video segments are handled by the caller
+/// (one segment file is shared by many rows).
+pub fn delete_frames_before(cutoff_micros: i64) -> Result<(u32, u32), String> {
     let paths: Vec<String> = with_db(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT image_path FROM frames WHERE timestamp < ?1"
+            "SELECT image_path FROM frames WHERE timestamp < ?1 AND image_path NOT LIKE 'video://%'",
         )?;
-        let rows = stmt.query_map(rusqlite::params![cutoff], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params![cutoff_micros], |row| row.get(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     })?;
 
-    // Delete files
-    let mut deleted = 0u32;
-    for path in &paths {
-        if fs::remove_file(path).is_ok() {
-            deleted += 1;
+    let frames_root = paths::frames_root();
+    let mut files = 0u32;
+    for p in &paths {
+        // Only ever delete inside our own frames directory.
+        if std::path::Path::new(p).starts_with(&frames_root) && fs::remove_file(p).is_ok() {
+            files += 1;
         }
     }
 
-    // Delete from DB (FTS triggers will auto-clean search_index)
-    with_db(|conn| {
-        conn.execute("DELETE FROM frames WHERE timestamp < ?1", rusqlite::params![cutoff])?;
-        Ok(())
+    let rows = with_db(|conn| {
+        let n = conn.execute("DELETE FROM frames WHERE timestamp < ?1", rusqlite::params![cutoff_micros])?;
+        Ok(n as u32)
     })?;
+    Ok((rows, files))
+}
 
-    // Clean up empty date directories
-    let frames_base = data_dir().join("frames");
-    if let Ok(entries) = fs::read_dir(&frames_base) {
+/// Delete frames older than N days (legacy entry point; retention loop does more).
+pub fn cleanup_old_frames(retention_days: u32) -> Result<u32, String> {
+    if retention_days == 0 { return Ok(0); }
+    let cutoff = timeutil::now_micros() - (retention_days as i64 * 86_400 * 1_000_000);
+    let (rows, _) = delete_frames_before(cutoff)?;
+    remove_empty_frame_dirs();
+    log::info!("MindScope: Cleaned up {} old frames", rows);
+    Ok(rows)
+}
+
+pub fn remove_empty_frame_dirs() {
+    if let Ok(entries) = fs::read_dir(paths::frames_root()) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 if let Ok(mut rd) = fs::read_dir(entry.path()) {
@@ -570,18 +584,17 @@ pub fn cleanup_old_frames(retention_days: u32) -> Result<u32, String> {
             }
         }
     }
-
-    log::info!("MindScope: Cleaned up {} old frames", deleted);
-    Ok(deleted)
 }
 
-/// Read frame image as base64
+/// Read frame image as base64 (only from inside our frames directory).
 pub fn read_image_base64(path: &str) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+    let p = std::path::Path::new(path);
+    if !p.starts_with(paths::frames_root()) { return None; }
+    let bytes = fs::read(p).ok()?;
     Some(base64_encode(&bytes))
 }
 
-fn dir_size_bytes(path: &std::path::Path) -> u64 {
+pub fn dir_size_bytes(path: &std::path::Path) -> u64 {
     let mut size = 0;
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -608,20 +621,17 @@ pub fn get_all_apps() -> Result<Vec<String>, String> {
 /// Get a single frame by ID
 pub fn get_frame_by_id(frame_id: i64) -> Result<Option<FrameRow>, String> {
     with_db(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_name, ocr_text, image_path
-             FROM frames WHERE id = ?1"
-        )?;
-        let row = stmt.query_row(rusqlite::params![frame_id], |row| {
-            Ok(FrameRow {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_name: row.get(3)?,
-                ocr_text: row.get(4)?,
-                image_path: row.get(5)?,
-            })
-        }).optional()?;
+        let mut stmt = conn.prepare(&format!("SELECT {FULL_COLS} FROM frames WHERE id = ?1"))?;
+        let row = stmt.query_row(rusqlite::params![frame_id], row_to_frame).optional()?;
+        Ok(row)
+    })
+}
+
+/// Get a single frame by its stored image path (JPEG or video:// reference).
+pub fn get_frame_by_path(image_path: &str) -> Result<Option<FrameRow>, String> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(&format!("SELECT {FULL_COLS} FROM frames WHERE image_path = ?1 LIMIT 1"))?;
+        let row = stmt.query_row(rusqlite::params![image_path], row_to_frame).optional()?;
         Ok(row)
     })
 }
