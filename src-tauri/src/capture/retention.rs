@@ -144,3 +144,53 @@ pub fn enforce(retention_days: u32, budget_mb: u64) -> Report {
     report.bytes_after = db::dir_size_bytes(&data);
     report
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end against a temp MINDSCOPE_HOME: old day dirs + DB rows go, today stays,
+    /// and the byte budget removes the oldest day first.
+    #[test]
+    fn enforce_removes_old_days_and_respects_budget() {
+        let tmp = std::env::temp_dir().join(format!("mindscope-retention-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("MINDSCOPE_HOME", &tmp);
+        assert_eq!(paths::mindscope_home(), tmp);
+        db::init_db().expect("db");
+
+        let today = timeutil::today();
+        let old = timeutil::days_ago(100);
+        let mid = timeutil::days_ago(10);
+        let big = vec![0u8; 3 * 1024 * 1024];
+        for (date, n) in [(&old, 2usize), (&mid, 1usize), (&today, 1usize)] {
+            let (start, _) = timeutil::local_day_bounds_micros(date).unwrap();
+            for i in 0..n {
+                let p = paths::frames_dir(date).join(format!("frame_{i}.jpg"));
+                fs::write(&p, &big).unwrap();
+                db::insert_frame(start + 3_600_000_000 * (i as i64 + 1), "App", "Win", "text", "", p.to_str().unwrap()).unwrap();
+            }
+            fs::create_dir_all(paths::segments_dir().join(date)).unwrap();
+            fs::write(paths::segments_dir().join(date).join("seg_000000.mp4"), &big).unwrap();
+            fs::write(paths::audio_root().join(format!("{date}.jsonl")), "{}\n").unwrap();
+        }
+        assert_eq!(db::frame_watermark().0, 4);
+
+        // 1. Age: 90-day retention removes only the 100-day-old day.
+        let r = enforce(90, 0);
+        assert!(!paths::frames_root().join(&old).exists(), "old frames dir removed");
+        assert!(!paths::segments_dir().join(&old).exists(), "old segments removed");
+        assert!(!paths::audio_root().join(format!("{old}.jsonl")).exists(), "old audio removed");
+        assert!(paths::frames_root().join(&mid).exists());
+        assert!(paths::frames_root().join(&today).exists());
+        assert_eq!(db::frame_watermark().0, 2, "rows for the old day deleted: {r}");
+
+        // 2. Budget: 1 MB budget drops the 10-day-old day but never today.
+        let r = enforce(0, 1);
+        assert!(!paths::frames_root().join(&mid).exists(), "mid day removed by budget: {r}");
+        assert!(paths::frames_root().join(&today).exists(), "today kept");
+        assert_eq!(db::frame_watermark().0, 1);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
