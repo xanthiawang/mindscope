@@ -1,27 +1,15 @@
 # Detect People
 
-Create user entries for people detected in screenpipe data. Uses AI judgment to filter false positives.
+Reference rules for deciding which names in MindScope's screen text and
+transcripts are real people, and what a `user.<slug>.md` entry looks like.
+Candidates arrive inlined in the prompt (capitalised two-word names from OCR
+and transcripts); there is no script to run and no web search available in the
+tool-free loop — fill only what the activity itself supports and leave unknown
+fields out rather than inventing them.
 
-## Usage
+## Process
 
-```bash
-# Run candidate extraction
-python3 scripts/extract_candidate_names.py --date 2026-03-14
-
-# Then validate candidates and create entries (agent step)
-```
-
-## 4-Step Process
-
-### 1. Extract candidates
-
-```bash
-python3 scripts/extract_candidate_names.py --date YYYY-MM-DD
-```
-
-Returns JSON with OCR/audio candidates and existing user slugs.
-
-### 2. Validate with AI judgment
+### 1. Validate with judgment
 
 For each candidate, determine if it's a real person:
 
@@ -37,23 +25,11 @@ For each candidate, determine if it's a real person:
 
 **When in doubt, skip.** A missed person can be added later; a false entry pollutes the vault.
 
-### 3. Create entries with web search
+### 2. Entry format
 
-For each validated person:
-
-1. Web search: `name + "professor"` OR `name + "researcher"` OR `name + institution`
-2. Extract: institution, role, email (if public), bio summary
-3. Create entry with ALL fields filled -- never use placeholders like "[To be filled]"
-
-**If web search finds nothing**: skip creating the entry (likely false positive).
-
-**Generate a 23-character lowercase alphanumeric node ID** for each entry:
-
-```python
-import random, string, time
-node_id = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(23))
-timestamp_ms = int(time.time() * 1000)
-```
+For each validated person, use a 23-character lowercase alphanumeric `id`
+(any random string of that shape) and the current time in ms for `updated`/`created`.
+Omit fields you cannot fill from the activity — never write placeholders like "[To be filled]".
 
 **Entry template** (`user.<name-slug>.md`):
 
@@ -80,7 +56,7 @@ Brief research or professional summary.
 
 ## Context
 
-**How we connected**: Detected from screenpipe journal
+**How we connected**: Detected from MindScope screen/audio activity
 
 **Date**: YYYY-MM-DD
 
@@ -91,7 +67,7 @@ Brief research or professional summary.
 Any relevant observations from the detection context.
 ```
 
-### 4. Return detected people as JSON
+### 3. Return detected people as JSON
 
 Return results for the calling skill (e.g., daily-journal) to use for linking:
 
@@ -116,6 +92,4 @@ Brief text summary:
 
 ---
 
-**Key Principle**: When in doubt, skip. All created entries must be fully populated with real information from web search. No placeholders.
-
-**Auto-run**: This skill is automatically called during the `daily-journal` workflow.
+**Key Principle**: When in doubt, skip. Entries contain only information the activity supports. No placeholders.

@@ -17,8 +17,8 @@ created: 0
       ## Recent People
       ## Source Sync Status
   - Anything outside those sections is USER-OWNED. Preserve verbatim.
-  - All updates MUST go through the Edit tool (old_string → new_string).
-    NEVER use Write on this file.
+  - Synapse runs tool-free: it receives this file in the prompt and returns the
+    full updated text; MindScope writes it back and re-applies the caps.
 -->
 
 ## Current Focus

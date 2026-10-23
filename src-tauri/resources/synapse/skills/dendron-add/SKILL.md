@@ -11,7 +11,7 @@ Invoke when the user wants to add information to their vault: meeting notes, pap
 1. **Analyzes** content to determine type (meeting, paper, project, person, science, daily)
 2. **Extracts** entities (people, dates, topics, citations)
 3. **Routes** to correct hierarchy (`meet.*`, `user.*`, `proj.*`, `sci.*`, `daily.*`, `scratch.*`)
-4. **Creates** note with rich frontmatter, **updates** indexes, **commits** changes
+4. **Creates** note with rich frontmatter and **updates** indexes
 
 ## Usage
 
@@ -130,7 +130,7 @@ Diff-based edits (not full rewrites) to:
 2. **Year/month indexes**: `meet.YYYY.md`, `proj.YYYY.md` (if applicable)
 3. **Cross-references**: `_index.by-person.md`, `_index.by-project.md`, `_index.by-topic.md`
 
-### Step 7: Preview & Confirm
+### Step 7: Preview & Confirm (final step)
 
 ```
 Classification: Meeting Note (92%)
@@ -140,13 +140,6 @@ Projects: proj.2026.protein-design
 Topics: yeast-display, binding-affinity
 Indexes to update: meet.md, meet.2026.md, _index.by-person.md, _index.by-project.md
 Proceed? (Y/n)
-```
-
-### Step 8: Commit
-
-```bash
-git add notes/meet.2026.03.10.md notes/meet.md notes/meet.2026.md notes/_index.*
-git commit -m "Add: meeting — Lab meeting on binder screening results"
 ```
 
 ---
@@ -163,4 +156,5 @@ git commit -m "Add: meeting — Lab meeting on binder screening results"
 - Create filenames with spaces or special characters
 - Skip frontmatter metadata
 - Forget to update indexes
+- Run `git` or any shell command — MindScope's vault is not a git repository and the Synapse loop is tool-free
 - Use placeholder text — every field must be populated or omitted

@@ -11,7 +11,8 @@ created: 0
   - This is the WARM tier between hot _working-memory.md and cold vault/*.md.
   - Updated at end of each Synapse loop pass (every ~30 min), NOT every frame.
   - HARD CAP: 8000 characters. Auto-decay the oldest entries if exceeded.
-  - Patch-based updates only: Edit tool with old_string → new_string.
+  - Synapse runs tool-free: it returns the full updated text of this file;
+    MindScope writes it back and re-applies the cap.
 
   AUTO-DECAY THRESHOLDS:
   - Unchecked task `- [ ]` older than 14 days → move to Needs Triage

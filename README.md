@@ -74,9 +74,9 @@ Memory is organized in three tiers — just like human memory:
 | 🌤 **Warm** | `_warm-memory.md` | Rolling context — follow-ups, project momentum, collaborator state |
 | ❄ **Cold** | `meet.*.md`, `user.*.md`, `proj.*.md`, `daily.journal.*.md` | Long-term vault, one file per entity |
 
-Synapse uses **Edit-only, section-scoped patches** with hard size caps (4 KB Hot, 8 KB Warm) to prevent memory drift — your manual notes in the `## User Notes` zone are never touched. Background loops route through **Claude Haiku** to keep costs minimal; only the **Ask AI** button uses Sonnet for deep reasoning.
+Synapse calls Claude **tool-free**: the current memory files and recent activity are inlined in the prompt, Claude returns the updated files as text, and MindScope writes them back while enforcing hard size caps (4 KB Hot, 8 KB Warm) and restoring the `## User Notes` zone verbatim. The loop skips a pass when nothing new was recorded, every call has a timeout, and a daily call budget (`claude_daily_budget`, default 120) caps spend. Background loops route through **Claude Haiku**; only the **Ask AI** button uses the default model for deep reasoning.
 
-Bundled skills (`command-center`, `daily-journal`, `detect-people`, `sync/vault-updater`) ship with the app. No external install, no OAuth, no cloud.
+Bundled reference skills (`command-center`, `daily-journal`, `detect-people`, `dendron-add`, `dendron-query`) ship with the app. No external install, no OAuth, no cloud.
 
 > 📖 For a walkthrough of how all this works together, see [**How MindScope Works**](docs/HOW_IT_WORKS.md).
 
