@@ -145,7 +145,7 @@ npm run tauri dev      # Vite + cargo run; helpers are copied to src-tauri/targe
 cd src-tauri && cargo test --lib     # unit tests (PII, local-time, text helpers)
 ```
 
-Set `MINDSCOPE_HOME=/some/throwaway/dir` to run against an empty data directory instead of `~/.mindscope` (settings, DB, frames, vault all live under it). Screen Recording permission is granted per app bundle, so for permission-dependent testing run the built `.app` rather than the dev binary.
+Set `MINDSCOPE_HOME=/some/throwaway/dir` to run against an empty data directory instead of `~/.mindscope` (settings, DB, frames, vault all live under it), and `MINDSCOPE_DISABLE_CLAUDE=1` to keep a test run from invoking the Claude CLI at all. Screen Recording permission is granted per app bundle, so for permission-dependent testing run the built `.app` rather than the dev binary.
 
 ---
 

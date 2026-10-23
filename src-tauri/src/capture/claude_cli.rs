@@ -115,8 +115,17 @@ fn supports_max_turns(claude: &PathBuf) -> bool {
     })
 }
 
+/// Test hook: `MINDSCOPE_DISABLE_CLAUDE=1` makes every call fail fast without
+/// spawning anything (runtime tests against a throwaway MINDSCOPE_HOME).
+fn disabled_by_env() -> bool {
+    std::env::var_os("MINDSCOPE_DISABLE_CLAUDE").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+}
+
 /// Run one `claude -p` call. `purpose` is only used for logging.
 pub fn run(purpose: &str, prompt: &str, opts: CallOpts) -> Result<String, String> {
+    if disabled_by_env() {
+        return Err("Claude CLI disabled by MINDSCOPE_DISABLE_CLAUDE".into());
+    }
     let s = settings::load_settings();
     let claude = tools::find_claude()
         .ok_or_else(|| "Claude CLI not found (set claude_path in settings.json or install `claude` on PATH)".to_string())?;
@@ -202,5 +211,5 @@ pub fn run_background(purpose: &str, prompt: &str) -> Result<String, String> {
     run(purpose, prompt, CallOpts::background())
 }
 
-/// Is a `claude` binary available at all?
-pub fn available() -> bool { tools::find_claude().is_some() }
+/// Is a `claude` binary available (and not disabled for this run)?
+pub fn available() -> bool { !disabled_by_env() && tools::find_claude().is_some() }
